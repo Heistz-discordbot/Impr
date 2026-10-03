@@ -1,5 +1,5 @@
 """
-Imperium Discord Bot - discord.py 2.x
+Cruxer Discord Bot (formerly Imperium) - discord.py 2.x
 
 Install (Components V2 layouts need discord.py 2.6 or newer):
   pip install -U "discord.py>=2.6" aiohttp python-dotenv
@@ -9,45 +9,55 @@ the Discord Developer Portal (Bot tab).
 
 The bot also needs these server permissions to use every feature below:
 Manage Channels, Manage Roles, Manage Webhooks, Manage Guild (for invites),
-Kick Members, View Audit Log, Embed Links, Attach Files.
+Kick Members, View Audit Log, Embed Links, Attach Files, Read Message History.
 
 Data (raid numbers, ticket info, stats, panel/leaderboard message ids,
 rate limits, win streaks, saved configuration, the permanent ticket archive)
-is stored in imperium_data.json next to this file, so it survives restarts.
+is stored in cruxer_data.json next to this file, so it survives restarts.
+If you already have an imperium_data.json, the bot keeps using it (nothing is
+lost by the rename). Set CRUXER_DATA_FILE (or the old IMPERIUM_DATA_FILE) in
+your .env to store it somewhere else, for example a persistent volume on your
+host - if your host wipes files on every redeploy, you MUST do this or the
+global leaderboard will reset.
 
-Roblox features (/hitlist, /see, /whois status, join checks, helper warnings)
-need ROBLOX_COOKIE in your .env - the .ROBLOSECURITY cookie of a Roblox
-account (use a spare/alt account, never your main). Roblox's presence API
-refuses anonymous requests.
+Roblox features (/hitlist, /see, /whois, /frnd, join checks, helper warnings,
+request verification, automatic server link + region) need ROBLOX_COOKIE in
+your .env - the .ROBLOSECURITY cookie of a Roblox account (use a spare/alt
+account, never your main). Roblox's presence API refuses anonymous requests.
+
+Optional .env values:
+  RALVORA_API_URL / RALVORA_API_KEY  - a region API to try first (see detect_server_region)
 
 Changes in this version (latest first):
-  - #snipe is created on /authorize, on startup for authorized servers, and on
-    demand; ALL snipe alerts go only there
-  - /hitlist alerts only when a tracked player JOINS; /see <username> instantly
-    shows where a player is right now with the join link
-  - /whois (owner only, public reply): full Roblox profile + Discord info
-  - "Joins Off Or Not In-Game" check before a request (Privacy / Link / Retry)
-  - Helper still Roblox-offline 5 minutes after joining -> warning in the ticket;
-    helper never online by the time the raid ends -> warning in #logs
-  - Every ticket is archived permanently (/tickets-export downloads it)
-  - Safer /link (one Roblox account per Discord account, code check ignores case)
-  Earlier changes:
-  - /sync, /add, /audit, /view, /link, /unlink, #snipe channel for alerts
-  - /hitlist add|remove (Roblox presence tracking, admins)
-  - /blacklist add|remove, /role add|remove (owner only)
-  - [OWN] tag on every owner-only command description
+  - Renamed Imperium -> Cruxer everywhere (old category/data file still recognised)
+  - Request limit is now a 24 hour window that starts at the member's first
+    request (3pm today -> 3pm tomorrow), then resets
+  - After a request is created the member gets a "Dispatched Successfully"
+    info card (ticket channel, usage status, when the limit resets)
+  - /frnd request (owner): Roblox friend request from the bot's Roblox account +
+    a Discord DM with a link to add the developer (bots cannot send Discord
+    friend requests)
+  - /see: tells you if the player is in a server; joins on = full info, join
+    link and server region; joins off = game + basic info only
+  - /hitlist add: shows the target's whole Roblox profile; if the target is
+    already in a server the alert is sent immediately
+  - Server region is auto-detected (leave the region box empty) and members who
+    linked their Roblox account are no longer asked for a server link - it is
+    taken from the server they are in right now
+  - When the bot is removed with /deauthorize or /bot stats a farewell channel
+    is created first; if it is kicked, the server owner gets a farewell DM
+    (a kicked bot has no access left to create a channel)
+  Earlier changes (all still included):
+  - Atomic data file with .bak backup, corrupt file moved aside
+  - Requests need an existing Roblox profile AND a joinable game; verified join
+    link stored; ticket info shows the SERVER LINK
+  - One panel/leaderboard copy per channel, on_ready setup runs once
+  - #snipe channel for all hitlist/see alerts
+  - /whois, /sync, /add, /audit, /view, /link, /unlink, /blacklist, /role,
+    /tickets-export, /bot stats, /antinuke, /overview, /member-stats
+  - Helper offline warnings (in the ticket after 5 minutes, in #logs at the end)
   - Global leaderboard is never reset; a member's SERVER stats reset when
     they leave that server
-  1. Request panel rebuilt to match the reference layout, with a Raid/Backup
-     select menu instead of the "Request Help" button, plus a working
-     Configuration button (saves your Roblox username for autofill).
-  2. Leaderboard rebuilt to match the video (Global / Server Total / Server
-     Daily select, Your Current Stats + My Rank, Rankings + Top 10, pager).
-     Only wording change: Help(s) -> Assist(s).
-  3. The "Raid #N is completed" log message no longer has any buttons.
-  4. When a member joins a raid/backup, only a link to their Roblox profile
-     is shown (no username/bio text).
-  5. New owner-only command: /bot stats (public message so everyone can see it).
 """
 
 import asyncio
@@ -58,7 +68,9 @@ import math
 import os
 import re
 import secrets
+import shutil
 import time
+import uuid
 from datetime import datetime, timezone
 
 import aiohttp
@@ -70,6 +82,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ======================= CONFIG =======================
+
+BOT_NAME = "Cruxer"
+LEGACY_BOT_NAME = "Imperium"
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -89,7 +104,8 @@ PING_ROLE_ID = 0
 
 EMBED_COLOR = 0x2B2D31
 
-AUTHORIZE_CATEGORY_NAME = "Imperium"
+AUTHORIZE_CATEGORY_NAME = BOT_NAME
+CATEGORY_NAMES = {BOT_NAME.lower(), LEGACY_BOT_NAME.lower()}  # old servers still have "Imperium"
 BATTLE_PANEL_CHANNEL_NAME = "battle-panel"
 RAID_RESULTS_CHANNEL_NAME = "raid-results"
 LEADERBOARD_CHANNEL_NAME = "leaderboard"
@@ -97,17 +113,29 @@ LOGS_CHANNEL_NAME = "logs"
 MVPS_CHANNEL_NAME = "mvps"
 SNIPE_CHANNEL_NAME = "snipe"
 README_CHANNEL_NAME = "read-me"
+FAREWELL_CHANNEL_NAME = "cruxer-farewell"
 
 SUPPORT_SERVER_INVITE = None
 
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imperium_data.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_NEW_DATA = os.path.join(_BASE_DIR, "cruxer_data.json")
+_OLD_DATA = os.path.join(_BASE_DIR, "imperium_data.json")
+DATA_FILE = (
+    os.getenv("CRUXER_DATA_FILE")
+    or os.getenv("IMPERIUM_DATA_FILE")
+    or (_OLD_DATA if os.path.exists(_OLD_DATA) and not os.path.exists(_NEW_DATA) else _NEW_DATA)
+)
+BACKUP_FILE = DATA_FILE + ".bak"
 
 LEADERBOARD_PAGE_SIZE = 10
 DURATION_UPDATE_SECONDS = 30
 DAILY_REQUEST_LIMIT = 2
+RATE_WINDOW_SECONDS = 24 * 60 * 60  # window starts at the member's first request
 ANTINUKE_WINDOW_SECONDS = 600  # look back 10 minutes for recent activity
 
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")
+RALVORA_API_URL = os.getenv("RALVORA_API_URL")
+RALVORA_API_KEY = os.getenv("RALVORA_API_KEY")
 TRACKER_POLL_SECONDS = 20
 MAX_TRACKED_PER_GUILD = 25
 OWN = "[OWN] "
@@ -123,13 +151,26 @@ REQUIRE_LINK = False            # True = members must /link before they can requ
 # ======================================================
 
 def load_data():
-    data = {}
-    if os.path.exists(DATA_FILE):
+    data = None
+    for path in (DATA_FILE, BACKUP_FILE):
+        if not os.path.exists(path):
+            continue
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            data = {}
+            if path == BACKUP_FILE:
+                print(f"[{BOT_NAME}] Main data file was unreadable - restored from the backup.")
+            break
+        except json.JSONDecodeError as exc:
+            print(f"[{BOT_NAME}] {path} is corrupt ({exc!r}). Moving it aside, NOT overwriting it.")
+            try:
+                os.replace(path, f"{path}.corrupt-{int(time.time())}")
+            except OSError:
+                pass
+        except OSError as exc:
+            raise SystemExit(f"[{BOT_NAME}] Cannot read {path}: {exc!r}. Refusing to start so no data is lost.")
+    if data is None:
+        data = {}
 
     data.setdefault("raid_counters", {})
     data.setdefault("tickets", {})
@@ -155,8 +196,17 @@ def load_data():
 
 
 def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(DATA, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    if os.path.exists(DATA_FILE):
+        try:
+            shutil.copyfile(DATA_FILE, BACKUP_FILE)
+        except OSError:
+            pass
+    os.replace(tmp, DATA_FILE)  # atomic: the file is never half-written
 
 
 DATA = load_data()
@@ -236,31 +286,48 @@ def get_rank(guild_id: int, user_id: int, scope: str):
     return None, 0, len(entries)
 
 
-def rate_limit_status(guild_id: int, user_id: int, limit: int = DAILY_REQUEST_LIMIT):
-    """Check the limit WITHOUT using up a request."""
+# ---- request limit: a 24h window that starts at the member's FIRST request ----
+
+def _active_window(guild_id: int, user_id: int):
+    """Returns the member's live limit entry, or None when there is no active 24h window."""
     entry = DATA["request_limits"].get(str(guild_id), {}).get(str(user_id))
-    count = entry["count"] if entry and entry.get("date") == today_str() else 0
-    return count < limit, count
+    if not entry or "window_start" not in entry:  # old format (per-day counter) is simply ignored
+        return None
+    if time.time() >= entry["window_start"] + RATE_WINDOW_SECONDS:
+        return None
+    return entry
+
+
+def rate_limit_status(guild_id: int, user_id: int, limit: int = DAILY_REQUEST_LIMIT):
+    """Check the limit WITHOUT using up a request. Returns (allowed, used, resets_at_timestamp_or_None)."""
+    entry = _active_window(guild_id, user_id)
+    if entry is None:
+        return True, 0, None
+    return entry["count"] < limit, entry["count"], entry["window_start"] + RATE_WINDOW_SECONDS
 
 
 def check_and_increment_rate_limit(guild_id: int, user_id: int, limit: int = DAILY_REQUEST_LIMIT):
-    gid, uid = str(guild_id), str(user_id)
-    today = today_str()
-    guild_limits = DATA["request_limits"].setdefault(gid, {})
-    entry = guild_limits.get(uid)
+    """Uses one request. Returns (allowed, used, resets_at_timestamp)."""
+    entry = _active_window(guild_id, user_id)
+    if entry is None:
+        entry = {"window_start": int(time.time()), "count": 0}
+    resets = entry["window_start"] + RATE_WINDOW_SECONDS
 
-    if not entry or entry.get("date") != today:
-        entry = {"date": today, "count": 0}
-
+    guild_limits = DATA["request_limits"].setdefault(str(guild_id), {})
     if entry["count"] >= limit:
-        guild_limits[uid] = entry
+        guild_limits[str(user_id)] = entry
         save_data()
-        return False, entry["count"]
+        return False, entry["count"], resets
 
     entry["count"] += 1
-    guild_limits[uid] = entry
+    guild_limits[str(user_id)] = entry
     save_data()
-    return True, entry["count"]
+    return True, entry["count"], resets
+
+
+def rate_limit_text(count: int, resets) -> str:
+    when = f" Your requests reset <t:{resets}:R>." if resets else ""
+    return f"Rate limit reached ({count}/{DAILY_REQUEST_LIMIT}).{when}"
 
 
 def update_win_streak(guild_id: int, result: str) -> int:
@@ -344,6 +411,17 @@ def saved_roblox_name(user_id: int):
     return DATA["configs"].get(str(user_id), {}).get("roblox_username")
 
 
+def find_category(guild: discord.Guild):
+    """The ticket category: by id first, then by name (Cruxer, or the old Imperium name)."""
+    category = guild.get_channel(TICKET_CATEGORY_ID)
+    if isinstance(category, discord.CategoryChannel):
+        return category
+    return discord.utils.find(
+        lambda c: isinstance(c, discord.CategoryChannel) and c.name.lower() in CATEGORY_NAMES,
+        guild.categories,
+    )
+
+
 async def delete_previous(channel: discord.TextChannel, msg_key: str, chan_key: str):
     """Delete the stored panel/leaderboard message even if it lives in another channel."""
     gid = str(channel.guild.id)
@@ -361,6 +439,46 @@ async def delete_previous(channel: discord.TextChannel, msg_key: str, chan_key: 
         pass
 
 
+# ---- duplicate panel / leaderboard cleanup ----
+
+_refresh_locks: dict[str, asyncio.Lock] = {}
+
+
+def _collect_custom_ids(components) -> set:
+    """Walk a message's (possibly nested Components V2) components and return every custom_id."""
+    found, stack = set(), list(components or [])
+    while stack:
+        c = stack.pop()
+        cid = getattr(c, "custom_id", None)
+        if cid:
+            found.add(cid)
+        for attr in ("children", "components"):
+            kids = getattr(c, attr, None)
+            if kids:
+                try:
+                    stack.extend(kids)
+                except TypeError:
+                    pass
+        accessory = getattr(c, "accessory", None)
+        if accessory:
+            stack.append(accessory)
+    return found
+
+
+async def purge_old_messages(channel: discord.TextChannel, marker: str, msg_key: str, chan_key: str):
+    """Delete the stored message AND every other bot message in this channel that carries the marker component."""
+    await delete_previous(channel, msg_key, chan_key)
+    try:
+        async for msg in channel.history(limit=200):
+            if msg.author.id == bot.user.id and marker in _collect_custom_ids(msg.components):
+                try:
+                    await msg.delete()
+                except discord.HTTPException:
+                    pass
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 async def blacklist_gate(interaction: discord.Interaction) -> bool:
     """Returns False (and tells the user) when the member is blacklisted."""
     if interaction.user.id == DEVELOPER_ID:
@@ -369,7 +487,7 @@ async def blacklist_gate(interaction: discord.Interaction) -> bool:
     if not entry:
         return True
 
-    text = f"You are blacklisted from using Imperium.\n**Reason:** {entry.get('reason', 'No reason given')}"
+    text = f"You are blacklisted from using {BOT_NAME}.\n**Reason:** {entry.get('reason', 'No reason given')}"
     try:
         if interaction.response.is_done():
             await interaction.followup.send(text, ephemeral=True)
@@ -419,8 +537,8 @@ async def create_or_update_readme(guild: discord.Guild, authorized: bool):
         channel = await guild.create_text_channel(
             name=README_CHANNEL_NAME,
             overwrites=overwrites,
-            topic="Information about Imperium",
-            reason="Imperium Read-me channel",
+            topic=f"Information about {BOT_NAME}",
+            reason=f"{BOT_NAME} Read-me channel",
         )
         await channel.send(embed=embed, view=view)
         return channel
@@ -431,8 +549,8 @@ async def create_or_update_readme(guild: discord.Guild, authorized: bool):
 def build_readme_embed(guild: discord.Guild, authorized: bool) -> discord.Embed:
     if authorized:
         description = (
-            f"Thank you for authorizing Imperium in {guild.name}.\n\n"
-            "Imperium is a raid coordination bot. It lets members request a raid "
+            f"Thank you for authorizing {BOT_NAME} in {guild.name}.\n\n"
+            f"{BOT_NAME} is a raid coordination bot. It lets members request a raid "
             "or backup, opens a private ticket for the request, tracks who joins, "
             "and records the result once the raid is over.\n\n"
             f"For questions or support, contact the developer: <@{DEVELOPER_ID}>."
@@ -443,16 +561,189 @@ def build_readme_embed(guild: discord.Guild, authorized: bool) -> discord.Embed:
             "This is a premium bot and this server is currently unauthorized.\n\n"
             "To authorize your server, please join the support server and "
             "contact the developer to get access.\n\n"
-            "Imperium is a raid coordination bot. Once authorized, it lets "
+            f"{BOT_NAME} is a raid coordination bot. Once authorized, it lets "
             "members request a raid or backup, opens a ticket for the request, "
             "tracks who joins, and records the result once the raid is over."
         )
 
-    embed = discord.Embed(title="Imperium", description=description, color=EMBED_COLOR)
+    embed = discord.Embed(title=BOT_NAME, description=description, color=EMBED_COLOR)
     embed.add_field(name="Developer", value=f"<@{DEVELOPER_ID}>", inline=True)
     embed.add_field(name="Status", value="Authorized" if authorized else "Unauthorized", inline=True)
-    embed.set_footer(text="Imperium")
+    embed.set_footer(text=BOT_NAME)
     return embed
+
+
+# ======================================================
+# FAREWELL (when the bot is removed)
+# ======================================================
+
+def build_farewell_embed(guild_name: str) -> discord.Embed:
+    return discord.Embed(
+        title=f"Goodbye from {BOT_NAME}",
+        description=(
+            f"{BOT_NAME} has left **{guild_name}**.\n\n"
+            "Thank you for using the bot and for every raid you coordinated with it. "
+            f"If you want {BOT_NAME} back, or have any questions, contact the developer: <@{DEVELOPER_ID}>."
+        ),
+        color=EMBED_COLOR,
+    )
+
+
+async def send_farewell(guild: discord.Guild):
+    """Create a read-only farewell channel and post the goodbye message (used right before the bot leaves)."""
+    try:
+        channel = discord.utils.find(
+            lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == FAREWELL_CHANNEL_NAME,
+            guild.text_channels,
+        )
+        if channel is None:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True),
+            }
+            channel = await guild.create_text_channel(
+                name=FAREWELL_CHANNEL_NAME,
+                overwrites=overwrites,
+                topic=f"A goodbye from {BOT_NAME}",
+                reason=f"{BOT_NAME} farewell",
+            )
+        await channel.send(embed=build_farewell_embed(guild.name))
+        return channel
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        print(f"[{BOT_NAME}] Could not create the farewell channel in {guild.name}: {exc}")
+        return None
+
+
+_self_leaving: set[int] = set()  # servers the bot is leaving on purpose (farewell already sent)
+
+
+async def leave_with_farewell(guild: discord.Guild):
+    await send_farewell(guild)
+    _self_leaving.add(guild.id)
+    try:
+        await guild.leave()
+    except discord.HTTPException:
+        _self_leaving.discard(guild.id)
+
+
+# ======================================================
+# ROBLOX LOW-LEVEL HELPERS (cookie requests, region detection)
+# ======================================================
+
+_roblox_csrf: str | None = None
+_presence_warned = False
+GAME_NAME_CACHE: dict[int, str] = {}
+REGION_CACHE: dict[str, str] = {}
+
+
+async def roblox_authed_post(session: aiohttp.ClientSession, url: str, payload: dict, extra_headers: dict | None = None):
+    """POST with the bot's Roblox cookie + CSRF handling. Returns (status, json_or_None, headers)."""
+    global _roblox_csrf
+    if not ROBLOX_COOKIE:
+        return None, None, {}
+
+    headers = {"Content-Type": "application/json", "Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    for attempt in range(2):
+        if _roblox_csrf:
+            headers["X-CSRF-TOKEN"] = _roblox_csrf
+        try:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 403 and resp.headers.get("x-csrf-token") and attempt == 0:
+                    _roblox_csrf = resp.headers["x-csrf-token"]
+                    continue
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    data = None
+                return resp.status, data, dict(resp.headers)
+        except Exception as exc:
+            print(f"[{BOT_NAME}] Roblox POST {url} failed: {exc}")
+            return None, None, {}
+    return None, None, {}
+
+
+async def geolocate_ip(session: aiohttp.ClientSession, ip: str):
+    data = await roblox_json(session, f"https://get.geojs.io/v1/ip/geo/{ip}.json")
+    if not data:
+        return None
+    parts = []
+    for key in ("city", "region", "country_code"):
+        value = (data.get(key) or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    return ", ".join(parts) or None
+
+
+async def detect_server_region(session: aiohttp.ClientSession, place_id, job_id):
+    """Best-effort region for a live Roblox server. Returns text like "Ashburn, Virginia, US" or None.
+
+    1) RALVORA_API_URL (if you set one in .env) is tried first. I could not find public docs for
+       a "Ralvora" API, so the request/response shape below is a guess: GET ?placeId=..&jobId=..
+       and the first of region / server_region / location / country in the JSON is used.
+       Edit _try_ralvora() once you have the real docs.
+    2) Fallback that needs nothing extra: ask Roblox's gamejoin endpoint (with the bot's cookie)
+       for the server's datacenter IP and geolocate that IP. This is the same trick Roblox server
+       region browser extensions use. It is approximate - Roblox datacenter IPs do not always
+       map to the exact city.
+    """
+    if not place_id or not job_id:
+        return None
+    job_id = str(job_id).lower()
+    if job_id in REGION_CACHE:
+        return REGION_CACHE[job_id]
+
+    region = await _try_ralvora(session, place_id, job_id)
+    if not region:
+        region = await _try_gamejoin_region(session, place_id, job_id)
+    if region:
+        REGION_CACHE[job_id] = region
+        if len(REGION_CACHE) > 500:
+            REGION_CACHE.pop(next(iter(REGION_CACHE)))
+    return region
+
+
+async def _try_ralvora(session: aiohttp.ClientSession, place_id, job_id):
+    if not RALVORA_API_URL:
+        return None
+    headers = {"Authorization": f"Bearer {RALVORA_API_KEY}"} if RALVORA_API_KEY else {}
+    data = await roblox_json(session, RALVORA_API_URL, params={"placeId": place_id, "jobId": job_id}, headers=headers)
+    if isinstance(data, dict):
+        for key in ("region", "server_region", "location", "country"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+async def _try_gamejoin_region(session: aiohttp.ClientSession, place_id, job_id):
+    if not ROBLOX_COOKIE:
+        return None
+    status, data, _ = await roblox_authed_post(
+        session,
+        "https://gamejoin.roblox.com/v1/join-game-instance",
+        {
+            "placeId": int(place_id),
+            "isTeleport": False,
+            "gameId": str(job_id),
+            "gameJoinAttemptId": str(uuid.uuid4()),
+            "joinOrigin": "PlayButton",
+        },
+        extra_headers={"User-Agent": "Roblox/WinInet", "Referer": f"https://www.roblox.com/games/{place_id}"},
+    )
+    if status != 200 or not isinstance(data, dict):
+        return None
+    script = data.get("joinScript") or {}
+    ip = None
+    endpoints = script.get("UdmuxEndpoints") or []
+    if endpoints and isinstance(endpoints[0], dict):
+        ip = endpoints[0].get("Address")
+    ip = ip or script.get("MachineAddress")
+    if not ip:
+        return None
+    return await geolocate_ip(session, ip)
 
 
 # ======================================================
@@ -518,13 +809,10 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
 
         async def select_callback(interaction: discord.Interaction):
             request_type = request_select.values[0]
-            allowed, count = rate_limit_status(interaction.guild.id, interaction.user.id)
+            allowed, count, resets = rate_limit_status(interaction.guild.id, interaction.user.id)
 
             if not allowed:
-                await interaction.response.send_message(
-                    f"Rate limit reached ({count}/{DAILY_REQUEST_LIMIT}). Your raid requests reset in a day.",
-                    ephemeral=True,
-                )
+                await interaction.response.send_message(rate_limit_text(count, resets), ephemeral=True)
             else:
                 state, prefilled_link = "skip", None
                 try:
@@ -571,7 +859,7 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
                 "- **No Fake Alerts**: Fake alerts will result in a blacklist.\n"
                 "- **Active Profile**: Request from the Roblox account you are currently using.\n"
                 "- **Assist Others**: Earn rescue ranks by helping other players.\n"
-                f"- **Limit**: {DAILY_REQUEST_LIMIT} requests per member per day."
+                f"- **Limit**: {DAILY_REQUEST_LIMIT} requests per member every 24 hours."
             ),
             discord.ui.Separator(),
             discord.ui.TextDisplay(
@@ -596,28 +884,93 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
 
 async def refresh_panel(channel: discord.TextChannel):
     gid = str(channel.guild.id)
-    await delete_previous(channel, "panel_messages", "panel_channels")
+    lock = _refresh_locks.setdefault(f"panel:{gid}", asyncio.Lock())
+    async with lock:
+        # Removes the stored panel AND any other leftover panel in this channel.
+        await purge_old_messages(channel, "tsb:panel:request", "panel_messages", "panel_channels")
 
-    new_msg = await channel.send(view=PanelView())
-    DATA["panel_messages"][gid] = new_msg.id
-    DATA["panel_channels"][gid] = channel.id
-    save_data()
-    return new_msg
+        new_msg = await channel.send(view=PanelView())
+        DATA["panel_messages"][gid] = new_msg.id
+        DATA["panel_channels"][gid] = channel.id
+        save_data()
+        return new_msg
 
 
 # ======================================================
 # REQUEST FORM
 # ======================================================
 
+def is_roblox_url(link: str) -> bool:
+    return bool(re.match(r"^https?://([a-z0-9-]+\.)?roblox\.com/", link, re.I))
+
+
+def parse_roblox_link(link: str):
+    """Returns (place_id, job_id) found inside a Roblox link; either may be None."""
+    place = re.search(r"placeId=(\d+)", link) or re.search(r"roblox\.com/(?:[a-z\-]+/)?games/(\d+)", link, re.I)
+    job = re.search(r"gameInstanceId=([0-9a-fA-F\-]{8,})", link)
+    return (place.group(1) if place else None, job.group(1) if job else None)
+
+
+async def verify_requester(session: aiohttp.ClientSession, roblox_id: int, typed_link: str):
+    """Returns (ok, error_message, verified_join_link). typed_link may be empty (linked members)."""
+    if not ROBLOX_COOKIE:
+        return False, "Server verification is offline (the bot has no ROBLOX_COOKIE). Tell the developer.", None
+
+    presences = await roblox_presence(session, [roblox_id])
+    if presences is None:
+        return False, "I could not reach Roblox to check that you are in a game. Try again in a moment.", None
+
+    p = presences.get(roblox_id)
+    if not presence_in_game(p):
+        return False, "You are not in a Roblox game right now. Join your game first, then make the request.", None
+
+    place_id = p.get("placeId") or p.get("rootPlaceId")
+    job_id = p.get("gameId")
+    if not place_id or not job_id:
+        return False, (
+            "You are in a game, but your joins are off (or you are in a private server), so helpers cannot join you. "
+            "Set your experience joins to **Everyone** in Roblox privacy settings, then try again."
+        ), None
+
+    link_place, link_job = parse_roblox_link(typed_link or "")
+    if link_place and str(link_place) != str(place_id):
+        return False, "That server link is for a different game than the one you are in.", None
+    if link_job and link_job.lower() != str(job_id).lower():
+        return False, "That server link is not the server you are currently in. Copy the link from your current server.", None
+
+    return True, None, f"https://www.roblox.com/games/start?placeId={place_id}&gameInstanceId={job_id}"
+
+
+class DispatchView(discord.ui.LayoutView):
+    """The 'Request Dispatched Successfully' card the member sees after making a ticket."""
+
+    def __init__(self, request_type: str, raid_number: int, channel: discord.TextChannel, used: int, resets: int):
+        super().__init__(timeout=None)
+        remaining = max(0, DAILY_REQUEST_LIMIT - used)
+        self.add_item(discord.ui.Container(
+            discord.ui.TextDisplay(
+                f"**{request_type} Request [#{raid_number}] Dispatched Successfully!**\n\n"
+                f"- **Ticket Channel:** {channel.mention}\n"
+                f"- **Usage Status:** `{used}/{DAILY_REQUEST_LIMIT} used ({remaining} remaining)`\n"
+                f"- **Usage Resets:** <t:{resets}:R>\n\n"
+                "-# All helpers have been notified. Tap the channel link above to view your live ticket."
+            ),
+        ))
+
+
 class RequestModal(discord.ui.Modal):
     def __init__(self, request_type: str, user_id: int = 0, server_link_default: str | None = None):
         super().__init__(title=f"{request_type} Request")
         self.request_type = request_type
 
+        # Linked members are never asked for a server link: it is read from the server they are in.
+        self.auto_link = bool(DATA["links"].get(str(user_id))) and bool(ROBLOX_COOKIE)
+
         self.region = discord.ui.TextInput(
-            label="Server region",
-            default=DATA["configs"].get(str(user_id), {}).get("region"),
-            placeholder="e.g. NA, EU, AS, OCE",
+            label="Server region (empty = auto-detect)",
+            default=DATA["configs"].get(str(user_id), {}).get("region") or None,
+            placeholder="e.g. NA, EU, AS, OCE - or leave empty",
+            required=False,
             max_length=30,
         )
         self.reported_players = discord.ui.TextInput(
@@ -625,12 +978,6 @@ class RequestModal(discord.ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="Names of teamers, what happened, etc.",
             max_length=500,
-        )
-        self.server_link = discord.ui.TextInput(
-            label="Server link",
-            default=server_link_default,
-            placeholder="https://www.roblox.com/games/...",
-            max_length=300,
         )
         saved_username = saved_roblox_name(user_id)
         self.username = discord.ui.TextInput(label="Your Roblox username", default=saved_username, max_length=40)
@@ -643,14 +990,23 @@ class RequestModal(discord.ui.Modal):
             self.clan = discord.ui.TextInput(label="Enemy guild / clan", required=False, max_length=60)
             self.add_item(self.clan)
 
-        self.add_item(self.server_link)
+        self.server_link = None
+        if not self.auto_link:
+            self.server_link = discord.ui.TextInput(
+                label="Server link",
+                default=server_link_default,
+                placeholder="https://www.roblox.com/games/...",
+                max_length=300,
+            )
+            self.add_item(self.server_link)
+
         self.add_item(self.username)
 
     async def on_submit(self, interaction: discord.Interaction):
-        link = self.server_link.value.strip()
-        if not link.lower().startswith(("http://", "https://")):
+        link = self.server_link.value.strip() if self.server_link else ""
+        if self.server_link and not is_roblox_url(link):
             return await interaction.response.send_message(
-                "Server link must start with https://. Try again.", ephemeral=True
+                "Server link must be a valid roblox.com link. Try again.", ephemeral=True
             )
 
         await interaction.response.defer(ephemeral=True)
@@ -658,15 +1014,10 @@ class RequestModal(discord.ui.Modal):
         if guild is None:
             return await interaction.followup.send("This can only be used in a server.", ephemeral=True)
 
-        category = guild.get_channel(TICKET_CATEGORY_ID)
-        if not isinstance(category, discord.CategoryChannel):
-            category = discord.utils.find(
-                lambda c: isinstance(c, discord.CategoryChannel) and c.name.lower() == AUTHORIZE_CATEGORY_NAME.lower(),
-                guild.categories,
-            )
+        category = find_category(guild)
         if category is None:
             return await interaction.followup.send(
-                "Imperium is not authorized in this server yet. Run /authorize first.", ephemeral=True
+                f"{BOT_NAME} is not authorized in this server yet. Run /authorize first.", ephemeral=True
             )
 
         for existing in category.text_channels:
@@ -676,16 +1027,36 @@ class RequestModal(discord.ui.Modal):
                     f"You already have an open request: {existing.mention}", ephemeral=True
                 )
 
-        allowed, count = check_and_increment_rate_limit(guild.id, interaction.user.id)
+        allowed, count, resets = rate_limit_status(guild.id, interaction.user.id)
         if not allowed:
+            return await interaction.followup.send(rate_limit_text(count, resets), ephemeral=True)
+
+        # 1) The Roblox profile must exist
+        typed_name = self.username.value.strip().lstrip("@")
+        roblox = await get_roblox_profile(interaction.client.session, typed_name)
+        if not roblox:
             return await interaction.followup.send(
-                f"Rate limit reached ({count}/{DAILY_REQUEST_LIMIT}). Your raid requests reset in a day.",
+                f"I could not find a Roblox account named **{typed_name}**. Check the spelling and try again.",
                 ephemeral=True,
             )
+        roblox_id, roblox_name = roblox
 
-        roblox = await get_roblox_profile(interaction.client.session, self.username.value.strip())
-        roblox_id = roblox[0] if roblox else None
-        roblox_name = roblox[1] if roblox else self.username.value.strip()
+        # 2) They must be in a joinable game right now (and the typed link, if any, must match it)
+        ok, error, verified_link = await verify_requester(interaction.client.session, roblox_id, link)
+        if not ok:
+            return await interaction.followup.send(error, ephemeral=True)
+        link = verified_link  # store the verified live join link
+
+        # 3) Region: use what they typed, otherwise detect it from the live server
+        region = self.region.value.strip()
+        if not region:
+            place_id, job_id = parse_roblox_link(link)
+            region = await detect_server_region(interaction.client.session, place_id, job_id) or "Unknown"
+
+        # 4) Only now use up one of their requests
+        allowed, count, resets = check_and_increment_rate_limit(guild.id, interaction.user.id)
+        if not allowed:
+            return await interaction.followup.send(rate_limit_text(count, resets), ephemeral=True)
 
         raid_number = next_raid_number(guild.id)
 
@@ -706,7 +1077,7 @@ class RequestModal(discord.ui.Modal):
             )
         except discord.Forbidden:
             return await interaction.followup.send(
-                "I'm missing permissions. Give Imperium Manage Channels and try again.", ephemeral=True
+                f"I'm missing permissions. Give {BOT_NAME} Manage Channels and try again.", ephemeral=True
             )
 
         ticket = {
@@ -716,7 +1087,7 @@ class RequestModal(discord.ui.Modal):
             "requester_id": interaction.user.id,
             "roblox_username": roblox_name,
             "roblox_id": roblox_id,
-            "region": self.region.value.strip(),
+            "region": region,
             "clan": self.clan.value if self.clan else None,
             "reported_players": self.reported_players.value,
             "server_link": link,
@@ -747,7 +1118,9 @@ class RequestModal(discord.ui.Modal):
 
         await log_ticket_created(guild, ticket, ticket_msg.jump_url, profile_url)
 
-        await interaction.followup.send(f"Request created: {channel.mention}", ephemeral=True)
+        await interaction.followup.send(
+            view=DispatchView(self.request_type, raid_number, channel, count, resets), ephemeral=True
+        )
 
 
 def build_ticket_embed(ticket: dict) -> discord.Embed:
@@ -765,6 +1138,7 @@ def build_ticket_embed(ticket: dict) -> discord.Embed:
         embed.add_field(name="ENEMY GUILD", value=box(ticket["clan"]), inline=True)
 
     embed.add_field(name="REPORTED PLAYERS", value=box(ticket["reported_players"]), inline=False)
+    embed.add_field(name="SERVER LINK", value=ticket["server_link"], inline=False)
 
     elapsed = format_duration(int(time.time()) - ticket["started_at"])
     embed.add_field(name="DURATION", value=box(elapsed), inline=False)
@@ -775,7 +1149,7 @@ def build_ticket_embed(ticket: dict) -> discord.Embed:
         helpers_text = "No helpers yet."
     embed.add_field(name="HELPERS", value=helpers_text, inline=False)
 
-    embed.set_footer(text="Imperium")
+    embed.set_footer(text=BOT_NAME)
     return embed
 
 
@@ -1109,7 +1483,7 @@ async def log_ticket_created(guild: discord.Guild, ticket: dict, ticket_jump_url
     if ticket["type"] == "Raid":
         embed.add_field(name="Enemy Guild", value=ticket["clan"] or "None", inline=True)
     embed.add_field(name="Reported Players", value=box(ticket["reported_players"]), inline=False)
-    embed.set_footer(text="Imperium")
+    embed.set_footer(text=BOT_NAME)
 
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="More Info", style=discord.ButtonStyle.link, url=ticket_jump_url))
@@ -1204,12 +1578,7 @@ class ReopenTicketView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
 
-        category = guild.get_channel(TICKET_CATEGORY_ID)
-        if not isinstance(category, discord.CategoryChannel):
-            category = discord.utils.find(
-                lambda c: isinstance(c, discord.CategoryChannel) and c.name.lower() == AUTHORIZE_CATEGORY_NAME.lower(),
-                guild.categories,
-            )
+        category = find_category(guild)
 
         viewer = guild.get_role(VIEWER_ROLE_ID) or guild.default_role
         requester = guild.get_member(ticket["requester_id"])
@@ -1260,14 +1629,9 @@ CHANNEL_TYPES = [
 
 
 async def get_or_create_category(guild: discord.Guild) -> discord.CategoryChannel:
-    category = guild.get_channel(TICKET_CATEGORY_ID)
-    if not isinstance(category, discord.CategoryChannel):
-        category = discord.utils.find(
-            lambda c: isinstance(c, discord.CategoryChannel) and c.name.lower() == AUTHORIZE_CATEGORY_NAME.lower(),
-            guild.categories,
-        )
+    category = find_category(guild)
     if category is None:
-        category = await guild.create_category(AUTHORIZE_CATEGORY_NAME, reason="Imperium /authorize setup")
+        category = await guild.create_category(AUTHORIZE_CATEGORY_NAME, reason=f"{BOT_NAME} /authorize setup")
     return category
 
 
@@ -1294,7 +1658,7 @@ async def run_setup(guild: discord.Guild, selected_keys: set):
                 guild.text_channels,
             )
         if channel is None:
-            channel = await guild.create_text_channel(name, category=category, reason="Imperium /authorize setup")
+            channel = await guild.create_text_channel(name, category=category, reason=f"{BOT_NAME} /authorize setup")
         created[key] = channel
 
     if guild.id not in DATA["authorized_guilds"]:
@@ -1309,14 +1673,9 @@ async def run_setup(guild: discord.Guild, selected_keys: set):
     return category, created
 
 
-async def find_imperium_channels(guild: discord.Guild):
+async def find_bot_channels(guild: discord.Guild):
     found = []
-    category = guild.get_channel(TICKET_CATEGORY_ID)
-    if not isinstance(category, discord.CategoryChannel):
-        category = discord.utils.find(
-            lambda c: isinstance(c, discord.CategoryChannel) and c.name.lower() == AUTHORIZE_CATEGORY_NAME.lower(),
-            guild.categories,
-        )
+    category = find_category(guild)
     if category:
         found.extend(category.channels)
 
@@ -1348,7 +1707,7 @@ class ManualSetupSelect(discord.ui.Select):
         for key, label, _, _ in CHANNEL_TYPES:
             if key in created and created[key]:
                 lines.append(f"{label}: {created[key].mention}")
-        await interaction.followup.send("Imperium authorized (manual setup).\n" + "\n".join(lines), ephemeral=True)
+        await interaction.followup.send(f"{BOT_NAME} authorized (manual setup).\n" + "\n".join(lines), ephemeral=True)
 
 
 class ManualSetupView(discord.ui.View):
@@ -1370,7 +1729,7 @@ class AuthorizeConfirmView(discord.ui.View):
         for key, label, _, _ in CHANNEL_TYPES:
             if created.get(key):
                 lines.append(f"{label}: {created[key].mention}")
-        await interaction.followup.send("Imperium authorized (auto setup).\n" + "\n".join(lines), ephemeral=True)
+        await interaction.followup.send(f"{BOT_NAME} authorized (auto setup).\n" + "\n".join(lines), ephemeral=True)
 
     @discord.ui.button(label="Manual Setup", style=discord.ButtonStyle.secondary)
     async def manual_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1553,22 +1912,25 @@ async def make_leaderboard_view(client: commands.Bot, guild: discord.Guild, scop
 
 async def refresh_leaderboard(channel: discord.TextChannel):
     gid = str(channel.guild.id)
-    await delete_previous(channel, "leaderboard_messages", "leaderboard_channels")
+    lock = _refresh_locks.setdefault(f"lb:{gid}", asyncio.Lock())
+    async with lock:
+        # Removes the stored leaderboard AND any other leftover leaderboard in this channel.
+        await purge_old_messages(channel, "lb:scope", "leaderboard_messages", "leaderboard_channels")
 
-    view = await make_leaderboard_view(bot, channel.guild, "global", 0, None)
-    new_msg = await channel.send(view=view)
-    leaderboard_state[new_msg.id] = {"scope": "global", "page": 0}
-    DATA["leaderboard_messages"][gid] = new_msg.id
-    DATA["leaderboard_channels"][gid] = channel.id
-    save_data()
-    return new_msg
+        view = await make_leaderboard_view(bot, channel.guild, "global", 0, None)
+        new_msg = await channel.send(view=view)
+        leaderboard_state[new_msg.id] = {"scope": "global", "page": 0}
+        DATA["leaderboard_messages"][gid] = new_msg.id
+        DATA["leaderboard_channels"][gid] = channel.id
+        save_data()
+        return new_msg
 
 
 # ======================================================
 # BOT
 # ======================================================
 
-class ImperiumTree(app_commands.CommandTree):
+class CruxerTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await blacklist_gate(interaction)
 
@@ -1578,12 +1940,12 @@ class ImperiumTree(app_commands.CommandTree):
         await super().on_error(interaction, error)
 
 
-class ImperiumBot(commands.Bot):
+class CruxerBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True  # needed for /antinuke and member names
-        super().__init__(command_prefix="!", intents=intents, tree_cls=ImperiumTree)
+        super().__init__(command_prefix="!", intents=intents, tree_cls=CruxerTree)
         self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
@@ -1615,7 +1977,7 @@ class ImperiumBot(commands.Bot):
         await super().close()
 
 
-bot = ImperiumBot()
+bot = CruxerBot()
 
 
 @tasks.loop(seconds=DURATION_UPDATE_SECONDS)
@@ -1657,8 +2019,9 @@ async def before_duration_updater():
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def setup_panel(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     await refresh_panel(interaction.channel)
-    await interaction.response.send_message("Panel posted.", ephemeral=True)
+    await interaction.followup.send("Panel posted. Old panels were removed.", ephemeral=True)
 
 
 @bot.tree.command(name="leaderboard", description="Post/refresh the raid leaderboard in this channel")
@@ -1670,8 +2033,8 @@ async def leaderboard_command(interaction: discord.Interaction):
     await interaction.followup.send("Leaderboard posted.", ephemeral=True)
 
 
-@bot.tree.command(name="say", description="[OWN] Make Imperium send a message")
-@app_commands.describe(message="The message Imperium should send")
+@bot.tree.command(name="say", description="[OWN] Make Cruxer send a message")
+@app_commands.describe(message="The message Cruxer should send")
 @app_commands.guild_only()
 async def say_command(interaction: discord.Interaction, message: str):
     if interaction.user.id != DEVELOPER_ID:
@@ -1684,11 +2047,11 @@ async def say_command(interaction: discord.Interaction, message: str):
         await interaction.followup.send("I don't have permission to send messages here.", ephemeral=True)
 
 
-@bot.tree.command(name="ping", description="Check Imperium's latency and connection")
+@bot.tree.command(name="ping", description="Check Cruxer's latency and connection")
 @app_commands.guild_only()
 async def ping_command(interaction: discord.Interaction):
     latency_ms = round(bot.latency * 1000)
-    await interaction.response.send_message(f"Imperium is online.\nLatency: {latency_ms} ms")
+    await interaction.response.send_message(f"{BOT_NAME} is online.\nLatency: {latency_ms} ms")
 
 
 # ======================================================
@@ -1710,11 +2073,11 @@ async def member_stats_command(interaction: discord.Interaction, member: discord
 # /authorize, /deauthorize
 # ======================================================
 
-@bot.tree.command(name="authorize", description="[OWN] Set up Imperium in this server")
+@bot.tree.command(name="authorize", description="[OWN] Set up Cruxer in this server")
 @app_commands.guild_only()
 async def authorize_command(interaction: discord.Interaction):
     if interaction.user.id != DEVELOPER_ID:
-        return await interaction.response.send_message("Only the Imperium developer can use /authorize.", ephemeral=True)
+        return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /authorize.", ephemeral=True)
 
     guild = interaction.guild
     if guild is None:
@@ -1722,9 +2085,9 @@ async def authorize_command(interaction: discord.Interaction):
 
     lines = "\n".join(f"- {label}" for _, label, _, _ in CHANNEL_TYPES)
     embed = discord.Embed(
-        title="Authorize Imperium",
+        title=f"Authorize {BOT_NAME}",
         description=(
-            f"This will create an Imperium category in {guild.name} along with:\n{lines}\n\n"
+            f"This will create a {BOT_NAME} category in {guild.name} along with:\n{lines}\n\n"
             "Auto Setup creates everything above.\n"
             "Manual Setup lets you choose which channels to create (Snipe is always created)."
         ),
@@ -1733,11 +2096,11 @@ async def authorize_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=AuthorizeConfirmView(), ephemeral=True)
 
 
-@bot.tree.command(name="deauthorize", description="[OWN] Remove Imperium's setup from this server and leave")
+@bot.tree.command(name="deauthorize", description="[OWN] Remove Cruxer's setup from this server and leave")
 @app_commands.guild_only()
 async def deauthorize_command(interaction: discord.Interaction):
     if interaction.user.id != DEVELOPER_ID:
-        return await interaction.response.send_message("Only the Imperium developer can use /deauthorize.", ephemeral=True)
+        return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /deauthorize.", ephemeral=True)
 
     guild = interaction.guild
     if guild is None:
@@ -1745,10 +2108,10 @@ async def deauthorize_command(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    channels = await find_imperium_channels(guild)
+    channels = await find_bot_channels(guild)
     for ch in channels:
         try:
-            await ch.delete(reason="Imperium deauthorized")
+            await ch.delete(reason=f"{BOT_NAME} deauthorized")
         except (discord.Forbidden, discord.HTTPException, discord.NotFound):
             pass
 
@@ -1767,18 +2130,18 @@ async def deauthorize_command(interaction: discord.Interaction):
     save_data()
 
     try:
-        await interaction.followup.send("Imperium has been removed from this server. Leaving now.", ephemeral=True)
+        await interaction.followup.send(f"{BOT_NAME} has been removed from this server. Leaving now.", ephemeral=True)
     except discord.HTTPException:
         pass
 
-    await guild.leave()
+    await leave_with_farewell(guild)  # creates the farewell channel + message, then leaves
 
 
 # ======================================================
 # /overview
 # ======================================================
 
-@bot.tree.command(name="overview", description="View and manage Imperium's setup in this server")
+@bot.tree.command(name="overview", description="View and manage Cruxer's setup in this server")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def overview_command(interaction: discord.Interaction):
@@ -1790,13 +2153,13 @@ async def overview_command(interaction: discord.Interaction):
     server_assists = sum(DATA["stats"]["guilds"].get(gid, {}).values())
     uptime = format_duration(int(time.time()) - BOT_START_TIME)
 
-    embed = discord.Embed(title=f"Imperium Overview - {guild.name}", color=EMBED_COLOR)
+    embed = discord.Embed(title=f"{BOT_NAME} Overview - {guild.name}", color=EMBED_COLOR)
     embed.add_field(name="Authorized", value="Yes" if guild.id in DATA["authorized_guilds"] else "No", inline=True)
     embed.add_field(name="Bot Uptime", value=uptime, inline=True)
     embed.add_field(name="Open Tickets", value=str(open_tickets), inline=True)
     embed.add_field(name="Total Raids Logged", value=str(total_raids), inline=True)
     embed.add_field(name="Total Assists (Server)", value=str(server_assists), inline=True)
-    embed.set_footer(text="Imperium")
+    embed.set_footer(text=BOT_NAME)
 
     view = discord.ui.View(timeout=120)
 
@@ -1804,8 +2167,9 @@ async def overview_command(interaction: discord.Interaction):
         panel_channel = guild.get_channel(BATTLE_PANEL_CHANNEL_ID) or discord.utils.get(guild.text_channels, name=BATTLE_PANEL_CHANNEL_NAME)
         if not panel_channel:
             return await inter.response.send_message("Battle panel channel not found.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
         await refresh_panel(panel_channel)
-        await inter.response.send_message("Panel refreshed.", ephemeral=True)
+        await inter.followup.send("Panel refreshed.", ephemeral=True)
 
     async def refresh_leaderboard_cb(inter: discord.Interaction):
         lb_channel = guild.get_channel(LEADERBOARD_CHANNEL_ID) or discord.utils.get(guild.text_channels, name=LEADERBOARD_CHANNEL_NAME)
@@ -1834,7 +2198,7 @@ async def overview_command(interaction: discord.Interaction):
 # /bot stats  (owner only, public message)
 # ======================================================
 
-bot_group = app_commands.Group(name="bot", description="[OWN] Imperium bot management", guild_only=True)
+bot_group = app_commands.Group(name="bot", description="[OWN] Cruxer bot management", guild_only=True)
 
 
 def _truncate_field(lines: list[str], limit: int = 1000) -> str:
@@ -1858,7 +2222,7 @@ def build_bot_stats_embed(guild: discord.Guild) -> discord.Embed:
     server_assists = sum(DATA["stats"]["guilds"].get(gid, {}).values())
     uptime = format_duration(int(time.time()) - BOT_START_TIME)
 
-    embed = discord.Embed(title="Imperium - Bot Stats", color=EMBED_COLOR)
+    embed = discord.Embed(title=f"{BOT_NAME} - Bot Stats", color=EMBED_COLOR)
     embed.add_field(name="Authorized in this server", value="Yes" if authorized else "No", inline=True)
     embed.add_field(name="Administrator", value="Yes" if guild.me.guild_permissions.administrator else "No", inline=True)
     embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)} ms", inline=True)
@@ -1885,7 +2249,7 @@ def build_bot_stats_embed(guild: discord.Guild) -> discord.Embed:
         server_lines.append(f"**{discord.utils.escape_markdown(g.name)}** - {g.member_count or 0:,} members - {flag}")
     embed.add_field(name=f"Servers ({len(bot.guilds)})", value=_truncate_field(server_lines), inline=False)
 
-    embed.set_footer(text=f"Imperium - Uptime {uptime}")
+    embed.set_footer(text=f"{BOT_NAME} - Uptime {uptime}")
     return embed
 
 
@@ -1896,7 +2260,7 @@ class ConfirmLeaveView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != DEVELOPER_ID:
-            await interaction.response.send_message("Only the Imperium developer can do this.", ephemeral=True)
+            await interaction.response.send_message(f"Only the {BOT_NAME} developer can do this.", ephemeral=True)
             return False
         return True
 
@@ -1904,17 +2268,14 @@ class ConfirmLeaveView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         target = bot.get_guild(self.target_guild_id)
         if target is None:
-            return await interaction.response.edit_message(content="Imperium is not in that server anymore.", view=None)
+            return await interaction.response.edit_message(content=f"{BOT_NAME} is not in that server anymore.", view=None)
 
         name = target.name
         DATA["authorized_guilds"] = [g for g in DATA["authorized_guilds"] if g != target.id]
         save_data()
 
-        await interaction.response.edit_message(content=f"Imperium has been removed from **{name}**.", view=None)
-        try:
-            await target.leave()
-        except discord.HTTPException:
-            pass
+        await interaction.response.edit_message(content=f"{BOT_NAME} has been removed from **{name}**.", view=None)
+        await leave_with_farewell(target)  # farewell channel + message first, then leave
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1950,7 +2311,7 @@ class BotStatsView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != DEVELOPER_ID:
-            await interaction.response.send_message("Only the Imperium developer can use these controls.", ephemeral=True)
+            await interaction.response.send_message(f"Only the {BOT_NAME} developer can use these controls.", ephemeral=True)
             return False
         return True
 
@@ -1958,7 +2319,7 @@ class BotStatsView(discord.ui.View):
         target = bot.get_guild(guild_id)
         name = target.name if target else str(guild_id)
         await interaction.response.send_message(
-            f"Are you sure you want to remove Imperium from **{name}**?",
+            f"Are you sure you want to remove {BOT_NAME} from **{name}**?",
             view=ConfirmLeaveView(guild_id),
             ephemeral=True,
         )
@@ -1970,7 +2331,7 @@ class BotStatsView(discord.ui.View):
 @bot_group.command(name="stats", description="[OWN] Bot roles, servers, server stats and authorization")
 async def bot_stats_command(interaction: discord.Interaction):
     if interaction.user.id != DEVELOPER_ID:
-        return await interaction.response.send_message("Only the Imperium developer can use /bot stats.", ephemeral=True)
+        return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /bot stats.", ephemeral=True)
 
     # Not ephemeral - everyone in the channel can see the result.
     await interaction.response.defer()
@@ -1997,7 +2358,7 @@ async def antinuke_command(interaction: discord.Interaction):
     now = discord.utils.utcnow()
     cutoff = now.timestamp() - ANTINUKE_WINDOW_SECONDS
 
-    protected_channels = {ch.id for ch in await find_imperium_channels(guild)}
+    protected_channels = {ch.id for ch in await find_bot_channels(guild)}
 
     results = []
 
@@ -2007,7 +2368,7 @@ async def antinuke_command(interaction: discord.Interaction):
             overwrite = channel.overwrites_for(guild.default_role)
             if overwrite.send_messages is not False:
                 overwrite.send_messages = False
-                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="Imperium /antinuke")
+                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"{BOT_NAME} /antinuke")
                 locked += 1
         except (discord.Forbidden, discord.HTTPException):
             continue
@@ -2021,7 +2382,7 @@ async def antinuke_command(interaction: discord.Interaction):
             member = guild.get_member(entry.target.id) if entry.target else None
             if member:
                 try:
-                    await member.kick(reason="Imperium /antinuke - recently added bot")
+                    await member.kick(reason=f"{BOT_NAME} /antinuke - recently added bot")
                     kicked += 1
                 except (discord.Forbidden, discord.HTTPException):
                     continue
@@ -2036,7 +2397,7 @@ async def antinuke_command(interaction: discord.Interaction):
         for wh in webhooks:
             if wh.created_at and wh.created_at.timestamp() >= cutoff:
                 try:
-                    await wh.delete(reason="Imperium /antinuke")
+                    await wh.delete(reason=f"{BOT_NAME} /antinuke")
                     removed_webhooks += 1
                 except (discord.Forbidden, discord.HTTPException):
                     continue
@@ -2050,7 +2411,7 @@ async def antinuke_command(interaction: discord.Interaction):
         invites = await guild.invites()
         for invite in invites:
             try:
-                await invite.delete(reason="Imperium /antinuke")
+                await invite.delete(reason=f"{BOT_NAME} /antinuke")
                 revoked_invites += 1
             except (discord.Forbidden, discord.HTTPException):
                 continue
@@ -2067,7 +2428,7 @@ async def antinuke_command(interaction: discord.Interaction):
             channel = guild.get_channel(entry.target.id) if entry.target else None
             if channel and channel.id not in protected_channels:
                 try:
-                    await channel.delete(reason="Imperium /antinuke - recently created channel")
+                    await channel.delete(reason=f"{BOT_NAME} /antinuke - recently created channel")
                     deleted_channels += 1
                 except (discord.Forbidden, discord.HTTPException):
                     continue
@@ -2101,7 +2462,7 @@ async def require_admin(interaction: discord.Interaction) -> bool:
 async def require_owner(interaction: discord.Interaction) -> bool:
     if interaction.user.id == DEVELOPER_ID:
         return True
-    await interaction.response.send_message("Only the Imperium developer can use this command.", ephemeral=True)
+    await interaction.response.send_message(f"Only the {BOT_NAME} developer can use this command.", ephemeral=True)
     return False
 
 
@@ -2109,9 +2470,13 @@ async def require_owner(interaction: discord.Interaction) -> bool:
 # ROBLOX TRACKING  (/hitlist alerts)
 # ======================================================
 
-_roblox_csrf: str | None = None
-_presence_warned = False
-GAME_NAME_CACHE: dict[int, str] = {}
+def presence_in_game(p) -> bool:
+    """Roblox hides placeId/gameId when joins are off, so type 2 alone means 'in a game'."""
+    return bool(p) and p.get("userPresenceType") == 2
+
+
+def presence_sig(p) -> str:
+    return f"{p.get('gameId') or 'private'}:{p.get('placeId') or p.get('rootPlaceId') or p.get('lastLocation') or 'unknown'}"
 
 
 async def roblox_presence(session: aiohttp.ClientSession, user_ids: list[int]):
@@ -2139,7 +2504,7 @@ async def roblox_presence(session: aiohttp.ClientSession, user_ids: list[int]):
                     if not _presence_warned:
                         _presence_warned = True
                         print(
-                            f"[Imperium] Roblox presence returned HTTP {resp.status}. "
+                            f"[{BOT_NAME}] Roblox presence returned HTTP {resp.status}. "
                             "Set a valid ROBLOX_COOKIE in your .env to enable /hitlist and /see."
                         )
                     return None
@@ -2147,7 +2512,7 @@ async def roblox_presence(session: aiohttp.ClientSession, user_ids: list[int]):
                 data = await resp.json()
                 return {p["userId"]: p for p in data.get("userPresences", [])}
         except Exception as exc:
-            print(f"[Imperium] Roblox presence request failed: {exc}")
+            print(f"[{BOT_NAME}] Roblox presence request failed: {exc}")
             return None
     return None
 
@@ -2241,11 +2606,10 @@ def build_track_embed(t: dict, info: dict, state: str) -> discord.Embed:
 
     if hit:
         server_type = "Private / Join-Off" if private else "Public"
-        embed.add_field(
-            name="Game Info",
-            value=f"**Game:** {info.get('game', 'Unknown Game')}\n**Server:** {server_type}",
-            inline=True,
-        )
+        game_text = f"**Game:** {info.get('game', 'Unknown Game')}\n**Server:** {server_type}"
+        if info.get("region"):
+            game_text += f"\n**Region:** {info['region']}"
+        embed.add_field(name="Game Info", value=game_text, inline=True)
         job_id = info.get("job_id")
         embed.add_field(
             name="Server Job ID",
@@ -2257,7 +2621,7 @@ def build_track_embed(t: dict, info: dict, state: str) -> discord.Embed:
                 name="Warning",
                 value=(
                     "This player appears to be in a **private server** or has joins turned off. "
-                    "A direct join link is not available, the button only opens the game page."
+                    "A direct join link is not available."
                 ),
                 inline=False,
             )
@@ -2266,7 +2630,7 @@ def build_track_embed(t: dict, info: dict, state: str) -> discord.Embed:
 
     if t.get("avatar_url"):
         embed.set_thumbnail(url=t["avatar_url"])
-    embed.set_footer(text="Imperium Hitlist" if hit else "Imperium See")
+    embed.set_footer(text=f"{BOT_NAME} Hitlist" if hit else f"{BOT_NAME} See")
     return embed
 
 
@@ -2281,15 +2645,15 @@ def find_snipe_channel(guild: discord.Guild):
 
 
 async def ensure_snipe_channel(guild: discord.Guild):
-    """Find #snipe, or create it (inside the Imperium category) if it is missing."""
+    """Find #snipe, or create it (inside the Cruxer category) if it is missing."""
     channel = find_snipe_channel(guild)
     if channel is not None:
         return channel
     try:
         category = await get_or_create_category(guild)
-        return await guild.create_text_channel(SNIPE_CHANNEL_NAME, category=category, reason="Imperium snipe channel")
+        return await guild.create_text_channel(SNIPE_CHANNEL_NAME, category=category, reason=f"{BOT_NAME} snipe channel")
     except (discord.Forbidden, discord.HTTPException) as exc:
-        print(f"[Imperium] Could not create #snipe in {guild.name}: {exc}")
+        print(f"[{BOT_NAME}] Could not create #snipe in {guild.name}: {exc}")
         return None
 
 
@@ -2315,6 +2679,19 @@ async def resolve_snipe_channel(t: dict):
     return channel
 
 
+def track_join_view(info: dict):
+    """A Join Server / Open Game Page button for a found player, or None."""
+    place_id = info.get("place_id")
+    view = discord.ui.View(timeout=None)
+    if place_id and info.get("job_id") and not info.get("private"):
+        url = f"https://www.roblox.com/games/start?placeId={place_id}&gameInstanceId={info['job_id']}"
+        view.add_item(discord.ui.Button(label="Join Server", style=discord.ButtonStyle.link, url=url))
+    elif place_id:
+        url = f"https://www.roblox.com/games/{place_id}"
+        view.add_item(discord.ui.Button(label="Open Game Page", style=discord.ButtonStyle.link, url=url))
+    return view if view.children else None
+
+
 async def announce_found(t: dict, info: dict):
     channel = await resolve_snipe_channel(t)
     if channel is None:
@@ -2325,21 +2702,16 @@ async def announce_found(t: dict, info: dict):
 
     if t["kind"] == "hitlist":
         content = f"<@{t['added_by']}> **Target Detected:** `{who}` is currently in a server!"
-        view = discord.ui.View(timeout=None)
-        if info.get("private") or not info.get("job_id"):
-            url = f"https://www.roblox.com/games/{info['place_id']}"
-            view.add_item(discord.ui.Button(label="Open Game Page", style=discord.ButtonStyle.link, url=url))
-        else:
-            url = f"https://www.roblox.com/games/start?placeId={info['place_id']}&gameInstanceId={info['job_id']}"
-            view.add_item(discord.ui.Button(label="Join Server", style=discord.ButtonStyle.link, url=url))
-        kwargs["view"] = view
+        view = track_join_view(info)
+        if view:
+            kwargs["view"] = view
     else:
         content = f"<@{t['added_by']}> `{who}` is now playing **{info.get('game', 'Unknown Game')}**."
 
     try:
         return await channel.send(content=content, embed=build_track_embed(t, info, "found"), **kwargs)
     except discord.HTTPException as exc:
-        print(f"[Imperium] Could not send tracker alert: {exc}")
+        print(f"[{BOT_NAME}] Could not send tracker alert: {exc}")
         return None
 
 
@@ -2369,17 +2741,11 @@ async def announce_left(t: dict):
 
 
 async def process_tracker(t: dict, presence: dict | None):
-    in_game = bool(
-        presence
-        and presence.get("userPresenceType") == 2
-        and (presence.get("placeId") or presence.get("rootPlaceId"))
-    )
+    in_game = presence_in_game(presence)
 
     if in_game:
         t["miss"] = 0
-        place_id = presence.get("placeId") or presence.get("rootPlaceId")
-        job_id = presence.get("gameId")
-        sig = f"{job_id or 'private'}:{place_id}"
+        sig = presence_sig(presence)
         if t.get("sig") == sig:
             return
 
@@ -2387,14 +2753,7 @@ async def process_tracker(t: dict, presence: dict | None):
         if t.get("sig"):
             await announce_left(t)
 
-        game = await roblox_game_name(bot.session, presence.get("universeId"), presence.get("lastLocation"))
-        info = {
-            "game": game,
-            "place_id": place_id,
-            "job_id": job_id,
-            "private": not job_id,
-            "since": int(time.time()),
-        }
+        info = await presence_to_info(presence)
         msg = await announce_found(t, info)
         t["sig"] = sig
         t["info"] = info
@@ -2405,7 +2764,9 @@ async def process_tracker(t: dict, presence: dict | None):
     # Not in a game. Require two misses in a row so one flaky poll does not spam.
     if t.get("sig"):
         t["miss"] = t.get("miss", 0) + 1
-        if t["miss"] >= 2:
+        # Joins-off targets have no server id, so a rejoin can only be noticed by re-arming fast.
+        needed = 1 if str(t["sig"]).startswith("private:") else 2
+        if t["miss"] >= needed:
             await announce_left(t)
             t["sig"] = None
             t["miss"] = 0
@@ -2430,7 +2791,7 @@ async def tracker_loop():
         try:
             await process_tracker(t, presences.get(t["roblox_id"]))
         except Exception as exc:
-            print(f"[Imperium] Tracker error for {t.get('username')}: {exc}")
+            print(f"[{BOT_NAME}] Tracker error for {t.get('username')}: {exc}")
 
 
 @tracker_loop.before_loop
@@ -2448,9 +2809,10 @@ class TrackerAddModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
+        session = interaction.client.session
         typed = self.username.value.strip().lstrip("@")
 
-        roblox = await get_roblox_profile(interaction.client.session, typed)
+        roblox = await get_roblox_profile(session, typed)
         if not roblox:
             return await interaction.followup.send(f"I could not find a Roblox account named **{typed}**.", ephemeral=True)
         roblox_id, roblox_name = roblox
@@ -2465,18 +2827,10 @@ class TrackerAddModal(discord.ui.Modal):
         if key in DATA["trackers"]:
             return await interaction.followup.send(f"**{roblox_name}** is already being tracked.", ephemeral=True)
 
-        display_name, _ = await roblox_user_details(interaction.client.session, roblox_id)
-        avatar = await roblox_avatar_url(interaction.client.session, roblox_id)
+        display_name, _ = await roblox_user_details(session, roblox_id)
+        avatar = await roblox_avatar_url(session, roblox_id)
 
-        # If they are already in a game right now, remember that silently so only a NEW join alerts.
-        snap_sig, snap_info = None, None
-        snap_presences = await roblox_presence(interaction.client.session, [roblox_id])
-        snap_p = (snap_presences or {}).get(roblox_id)
-        if snap_p and snap_p.get("userPresenceType") == 2 and (snap_p.get("placeId") or snap_p.get("rootPlaceId")):
-            snap_sig = f"{snap_p.get('gameId') or 'private'}:{snap_p.get('placeId') or snap_p.get('rootPlaceId')}"
-            snap_info = await presence_to_info(snap_p)
-
-        DATA["trackers"][key] = {
+        t = {
             "kind": self.kind,
             "guild_id": guild.id,
             "channel_id": interaction.channel_id,
@@ -2485,29 +2839,42 @@ class TrackerAddModal(discord.ui.Modal):
             "display_name": display_name,
             "avatar_url": avatar,
             "added_by": interaction.user.id,
-            "sig": snap_sig,
-            "info": snap_info,
+            "sig": None,
+            "info": None,
             "message_id": None,
             "miss": 0,
         }
+        DATA["trackers"][key] = t
+
+        # Already in a game right now? Do not wait for a new join: find them immediately.
+        found_now = False
+        snap_presences = await roblox_presence(session, [roblox_id])
+        snap_p = (snap_presences or {}).get(roblox_id)
+        if presence_in_game(snap_p):
+            info = await presence_to_info(snap_p)
+            msg = await announce_found(t, info)
+            t["sig"] = presence_sig(snap_p)
+            t["info"] = info
+            t["message_id"] = msg.id if msg else None
+            found_now = msg is not None
         save_data()
         log_audit(f"{self.kind}_add", guild.id, interaction.user.id, roblox_id=roblox_id, roblox_username=roblox_name)
 
-        label = tracker_label(DATA["trackers"][key])
+        label = tracker_label(t)
         snipe = await ensure_snipe_channel(guild)
         where = snipe.mention if snipe else "#snipe (I could not create it - give me Manage Channels)"
         text = f"Now tracking **{label}**. Alerts will be posted only in {where}."
-        if snap_sig:
-            text += (
-                f"\n**{roblox_name}** is already in a game right now, so no alert was sent. "
-                "Use `/see` to get the info and join link instantly. You will be alerted the next time they join."
-            )
+        if found_now:
+            text += f"\n**{roblox_name}** is already in a game, so the alert was posted in {where} right now."
         if not ROBLOX_COOKIE:
             text += (
                 "\n\n**Warning:** ROBLOX_COOKIE is not set in the bot's .env, so Roblox will probably "
                 "refuse presence checks and no alerts will appear until it is set."
             )
-        await interaction.followup.send(text, ephemeral=True)
+
+        # The target's whole Roblox profile.
+        profile_embed = await build_roblox_embed(session, roblox_id, roblox_name)
+        await interaction.followup.send(text, embed=profile_embed, ephemeral=True)
 
 
 def find_tracker_key(guild_id: int, kind: str, username: str):
@@ -2568,6 +2935,70 @@ async def hitlist_remove(interaction: discord.Interaction, username: str):
     await remove_tracker(interaction, "hitlist", username)
 
 
+async def roblox_cookie_status(session: aiohttp.ClientSession):
+    """Is the bot's Roblox account (ROBLOX_COOKIE) actually logged in? Returns (ok, text)."""
+    if not ROBLOX_COOKIE:
+        return False, "ROBLOX_COOKIE is not set"
+    try:
+        async with session.get(
+            "https://users.roblox.com/v1/users/authenticated",
+            headers={"Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                return True, f"logged in as {data.get('name')}"
+            return False, f"Roblox rejected the cookie (HTTP {resp.status}) - it is expired or invalid"
+    except Exception as exc:
+        return False, f"could not reach Roblox ({exc!r})"
+
+
+@hitlist_group.command(name="debug", description="Show exactly what Roblox reports for every tracked target")
+async def hitlist_debug(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    session = interaction.client.session
+
+    ok, cookie_text = await roblox_cookie_status(session)
+    targets = [t for t in DATA["trackers"].values() if t["guild_id"] == interaction.guild.id and t["kind"] == "hitlist"]
+    lines = [
+        f"**Bot Roblox account:** {'OK' if ok else 'PROBLEM'} - {cookie_text}",
+        f"**Tracked targets:** {len(targets)}",
+        f"**Poll interval:** every {TRACKER_POLL_SECONDS}s",
+        "",
+    ]
+
+    if targets:
+        presences = await roblox_presence(session, [t["roblox_id"] for t in targets][:50])
+        if presences is None:
+            lines.append("**Presence check FAILED.** Roblox refused the request - this is usually a bad or expired ROBLOX_COOKIE.")
+        else:
+            for t in targets:
+                p = presences.get(t["roblox_id"]) or {}
+                ptype = p.get("userPresenceType", 0)
+                place = p.get("placeId") or p.get("rootPlaceId")
+                job = p.get("gameId")
+                if ptype == 2 and job and place:
+                    verdict = "In a game, joinable. An alert with a join button should fire."
+                elif ptype == 2:
+                    verdict = "In a game, but Roblox is hiding the server from the bot's account (joins closed to it). The alert fires without a join link."
+                elif ptype == 1:
+                    verdict = "Online, not in a game."
+                else:
+                    verdict = "Offline - or hiding their online status from the bot's account."
+                tracked = "alert already sent" if t.get("sig") else "waiting for him to join"
+                lines.append(
+                    f"**{t['username']}** - {PRESENCE_NAMES.get(ptype, 'Offline')}\n"
+                    f"-# lastLocation: `{p.get('lastLocation') or 'none'}` | placeId: `{place or 'hidden'}` | gameId: `{job or 'hidden'}` | state: {tracked}\n"
+                    f"-# {verdict}"
+                )
+
+    embed = discord.Embed(title="Hitlist Debug", description=_truncate_field(lines, 3900), color=EMBED_COLOR)
+    embed.set_footer(text=BOT_NAME)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 bot.tree.add_command(hitlist_group)
 
 
@@ -2601,11 +3032,11 @@ class BlacklistAddModal(discord.ui.Modal, title="Blacklist Member"):
         embed = discord.Embed(title="Member Blacklisted", color=EMBED_COLOR)
         embed.add_field(name="User", value=f"<@{uid}> (`{uid}`)", inline=False)
         embed.add_field(name="Reason", value=box(self.reason.value.strip()), inline=False)
-        embed.set_footer(text="Imperium")
+        embed.set_footer(text=BOT_NAME)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-blacklist_group = app_commands.Group(name="blacklist", description="[OWN] Block members from using Imperium", guild_only=True)
+blacklist_group = app_commands.Group(name="blacklist", description=f"[OWN] Block members from using {BOT_NAME}", guild_only=True)
 
 
 @blacklist_group.command(name="add", description="[OWN] Blacklist a member (asks for their user ID and a reason)")
@@ -2672,7 +3103,7 @@ async def role_add(interaction: discord.Interaction, member: discord.Member, rol
 
     await interaction.response.defer()
     try:
-        await member.add_roles(role, reason=f"Imperium /role add by {interaction.user}")
+        await member.add_roles(role, reason=f"{BOT_NAME} /role add by {interaction.user}")
     except discord.Forbidden:
         return await interaction.followup.send("I do not have permission to give that role.", ephemeral=True)
     await interaction.followup.send(f"Added {role.mention} to {member.mention}.", allowed_mentions=discord.AllowedMentions.none())
@@ -2691,7 +3122,7 @@ async def role_remove(interaction: discord.Interaction, member: discord.Member, 
 
     await interaction.response.defer()
     try:
-        await member.remove_roles(role, reason=f"Imperium /role remove by {interaction.user}")
+        await member.remove_roles(role, reason=f"{BOT_NAME} /role remove by {interaction.user}")
     except discord.Forbidden:
         return await interaction.followup.send("I do not have permission to remove that role.", ephemeral=True)
     await interaction.followup.send(f"Removed {role.mention} from {member.mention}.", allowed_mentions=discord.AllowedMentions.none())
@@ -2714,7 +3145,6 @@ async def on_member_remove(member: discord.Member):
     save_data()
 
 
-
 # ======================================================
 # COMMAND SYNC (per server = instant, no waiting on Discord's global cache)
 # ======================================================
@@ -2726,12 +3156,12 @@ async def sync_guild_commands(guild: discord.Guild):
     try:
         bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
-        print(f"[Imperium] Synced {len(synced)} commands to {guild.name}: " + ", ".join(sorted(c.name for c in synced)))
+        print(f"[{BOT_NAME}] Synced {len(synced)} commands to {guild.name}: " + ", ".join(sorted(c.name for c in synced)))
         return synced
     except discord.Forbidden:
-        print(f"[Imperium] Cannot sync commands in {guild.name} ({guild.id}). Re-invite the bot with the applications.commands scope.")
+        print(f"[{BOT_NAME}] Cannot sync commands in {guild.name} ({guild.id}). Re-invite the bot with the applications.commands scope.")
     except Exception as exc:
-        print(f"[Imperium] Command sync FAILED in {guild.name}: {exc!r}")
+        print(f"[{BOT_NAME}] Command sync FAILED in {guild.name}: {exc!r}")
     return None
 
 
@@ -2740,7 +3170,7 @@ async def sync_all_commands():
     try:
         await bot.http.bulk_upsert_global_commands(bot.application_id, [])
     except Exception as exc:
-        print(f"[Imperium] Could not clear global commands: {exc!r}")
+        print(f"[{BOT_NAME}] Could not clear global commands: {exc!r}")
     for guild in bot.guilds:
         await sync_guild_commands(guild)
 
@@ -2753,11 +3183,12 @@ async def sync_prefix_command(ctx: commands.Context):
     names = ", ".join(sorted(c.name for c in bot.tree.get_commands()))
     await ctx.reply(f"Commands re-synced in {len(bot.guilds)} server(s).\nTop-level commands: {names}\nRestart/refresh Discord (Ctrl+R) if they do not show up.")
 
+
 # ======================================================
 # /sync   (owner only)
 # ======================================================
 
-@bot.tree.command(name="sync", description="[OWN] Re-register Imperium's slash commands in every server")
+@bot.tree.command(name="sync", description=f"[OWN] Re-register {BOT_NAME}'s slash commands in every server")
 @app_commands.guild_only()
 async def sync_command(interaction: discord.Interaction):
     if not await require_owner(interaction):
@@ -2794,10 +3225,10 @@ async def add_command(interaction: discord.Interaction, item: app_commands.Choic
     try:
         if item.value == "panel":
             await refresh_panel(interaction.channel)
-            await interaction.followup.send("Old backup panel removed. New panel posted here.", ephemeral=True)
+            await interaction.followup.send("Old backup panels removed. New panel posted here.", ephemeral=True)
         else:
             await refresh_leaderboard(interaction.channel)
-            await interaction.followup.send("Old leaderboard removed. New leaderboard posted here.", ephemeral=True)
+            await interaction.followup.send("Old leaderboards removed. New leaderboard posted here.", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send("I do not have permission to send messages in this channel.", ephemeral=True)
 
@@ -2862,7 +3293,7 @@ class AuditView(discord.ui.View):
         self.next_btn.disabled = self.page >= pages - 1
 
         chunk = rows[self.page * AUDIT_PAGE_SIZE:(self.page + 1) * AUDIT_PAGE_SIZE]
-        embed = discord.Embed(title=f"Imperium Audit Log - {self.filt.title()}", color=EMBED_COLOR)
+        embed = discord.Embed(title=f"{BOT_NAME} Audit Log - {self.filt.title()}", color=EMBED_COLOR)
 
         if not chunk:
             embed.description = "Nothing logged yet."
@@ -2888,7 +3319,7 @@ class AuditView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != DEVELOPER_ID:
-            await interaction.response.send_message("Only the Imperium developer can use this.", ephemeral=True)
+            await interaction.response.send_message(f"Only the {BOT_NAME} developer can use this.", ephemeral=True)
             return False
         return True
 
@@ -2985,7 +3416,7 @@ async def view_command(interaction: discord.Interaction, member: discord.Member)
     else:
         embed.description = "This member has not created any tickets here."
 
-    embed.set_footer(text="Imperium")
+    embed.set_footer(text=BOT_NAME)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -3013,7 +3444,7 @@ async def live_server_link(user_id: int):
         return None
     result = await roblox_presence(bot.session, [link["roblox_id"]])
     p = (result or {}).get(link["roblox_id"])
-    if not p or p.get("userPresenceType") != 2:
+    if not presence_in_game(p):
         return None
     place_id = p.get("placeId") or p.get("rootPlaceId")
     job_id = p.get("gameId")
@@ -3071,7 +3502,8 @@ class LinkVerifyView(discord.ui.View):
 
         await interaction.followup.send(
             f"Linked to **{pending['username']}**. You can now remove the code from your Roblox profile.\n"
-            "Your username is autofilled, and when you request help while in a joinable server the server link is filled in for you.",
+            "Your username is autofilled, and when you request help the server link and region are taken "
+            "from the server you are in - you will not be asked for them.",
             ephemeral=True,
         )
 
@@ -3091,7 +3523,7 @@ class LinkModal(discord.ui.Modal, title="Link Roblox Account"):
             return await interaction.followup.send(
                 f"**{roblox_name}** is already linked to another Discord account.", ephemeral=True
             )
-        code = "IMPERIUM-" + secrets.token_hex(3).upper()
+        code = "CRUXER-" + secrets.token_hex(3).upper()
         DATA["pending_links"][str(interaction.user.id)] = {
             "roblox_id": roblox_id,
             "username": roblox_name,
@@ -3117,7 +3549,7 @@ async def link_command(interaction: discord.Interaction):
     await interaction.response.send_modal(LinkModal())
 
 
-@bot.tree.command(name="unlink", description="Unlink your Roblox account from Imperium")
+@bot.tree.command(name="unlink", description=f"Unlink your Roblox account from {BOT_NAME}")
 @app_commands.guild_only()
 async def unlink_command(interaction: discord.Interaction):
     uid = str(interaction.user.id)
@@ -3129,7 +3561,7 @@ async def unlink_command(interaction: discord.Interaction):
 
 
 # ======================================================
-# ROBLOX HELPERS (join check, /see, /whois)
+# ROBLOX HELPERS (join check, /see, /whois, /frnd)
 # ======================================================
 
 PRESENCE_NAMES = {0: "Offline", 1: "Online (not in a game)", 2: "In a game", 3: "In Roblox Studio"}
@@ -3150,7 +3582,7 @@ async def roblox_json(session: aiohttp.ClientSession, url: str, **kwargs):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), **kwargs) as resp:
             if resp.status == 200:
-                return await resp.json()
+                return await resp.json(content_type=None)
     except Exception:
         pass
     return None
@@ -3163,11 +3595,116 @@ def linked_discord_for_roblox(roblox_id: int, exclude: int | None = None):
     return None
 
 
-async def presence_to_info(presence: dict) -> dict:
+async def presence_to_info(presence: dict, with_region: bool = False) -> dict:
     place_id = presence.get("placeId") or presence.get("rootPlaceId")
     job_id = presence.get("gameId")
     game = await roblox_game_name(bot.session, presence.get("universeId"), presence.get("lastLocation"))
-    return {"game": game, "place_id": place_id, "job_id": job_id, "private": not job_id, "since": int(time.time())}
+    info = {"game": game, "place_id": place_id, "job_id": job_id, "private": not (job_id and place_id), "since": int(time.time())}
+    if with_region and place_id and job_id:
+        info["region"] = await detect_server_region(bot.session, place_id, job_id)
+    return info
+
+
+async def resolve_roblox_for_member(session: aiohttp.ClientSession, member: discord.abc.User):
+    """Best guess at a member's Roblox account: linked, then saved config, then last ticket. (id, name) or (None, None)."""
+    link = DATA["links"].get(str(member.id))
+    if link:
+        return link["roblox_id"], link["roblox_username"]
+    name = saved_roblox_name(member.id)
+    if not name:
+        mine = [t for t in DATA["ticket_archive"].values() if t.get("requester_id") == member.id and t.get("roblox_username")]
+        mine.sort(key=lambda t: t.get("started_at", 0), reverse=True)
+        name = mine[0]["roblox_username"] if mine else None
+    found = await get_roblox_profile(session, name) if name else None
+    return found if found else (None, None)
+
+
+def _clean(text: str, limit: int) -> str:
+    return (text or "").replace("`", "'")[:limit]
+
+
+async def build_roblox_embed(session: aiohttp.ClientSession, roblox_id: int, roblox_name: str) -> discord.Embed:
+    """The whole Roblox profile (used by /whois, /see and /hitlist add)."""
+    user_json, friends, followers, followings, history, groups, avatar, presences = await asyncio.gather(
+        roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}"),
+        roblox_json(session, f"https://friends.roblox.com/v1/users/{roblox_id}/friends/count"),
+        roblox_json(session, f"https://friends.roblox.com/v1/users/{roblox_id}/followers/count"),
+        roblox_json(session, f"https://friends.roblox.com/v1/users/{roblox_id}/followings/count"),
+        roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}/username-history", params={"limit": 10}),
+        roblox_json(session, f"https://groups.roblox.com/v2/users/{roblox_id}/groups/roles"),
+        roblox_avatar_url(session, roblox_id),
+        roblox_presence(session, [roblox_id]),
+    )
+    user_json = user_json or {}
+    created = iso_to_ts(user_json.get("created") or "")
+    url = roblox_profile_url(roblox_id)
+    created_text = f"<t:{created}:F> (<t:{created}:R>)" if created else "Unknown"
+
+    r = discord.Embed(title=f"Roblox - {user_json.get('name', roblox_name)}", url=url, color=EMBED_COLOR)
+    if avatar:
+        r.set_thumbnail(url=avatar)
+    r.add_field(
+        name="Profile",
+        value=(
+            f"**Username:** `{user_json.get('name', roblox_name)}`\n"
+            f"**Display name:** `{user_json.get('displayName', 'Unknown')}`\n"
+            f"**User ID:** `{roblox_id}`\n"
+            f"**Created:** {created_text}\n"
+            f"**Verified badge:** {'Yes' if user_json.get('hasVerifiedBadge') else 'No'}\n"
+            f"**Banned:** {'Yes' if user_json.get('isBanned') else 'No'}\n"
+            f"**Profile:** [Open Profile]({url})"
+        ),
+        inline=False,
+    )
+    r.add_field(
+        name="Social",
+        value=(
+            f"**Friends:** {(friends or {}).get('count', '?')}\n"
+            f"**Followers:** {(followers or {}).get('count', '?')}\n"
+            f"**Following:** {(followings or {}).get('count', '?')}\n"
+            f"**Groups:** {len((groups or {}).get('data', [])) if groups else '?'}"
+        ),
+        inline=True,
+    )
+
+    # Presence + join setting (Roblox does not expose privacy settings, so joins are inferred)
+    p = (presences or {}).get(roblox_id)
+    if presences is None:
+        status_text = "Unknown (set a valid ROBLOX_COOKIE to see this)"
+        joins_text = "Unknown"
+    else:
+        p = p or {}
+        ptype = p.get("userPresenceType", 0)
+        status_text = PRESENCE_NAMES.get(ptype, "Offline")
+        if ptype == 2:
+            game = await roblox_game_name(session, p.get("universeId"), p.get("lastLocation"))
+            status_text += f" - {game}"
+            joins_text = "Everyone / allowed (joinable server)" if p.get("gameId") else "Off or private (no join link available)"
+        else:
+            joins_text = "Only visible while the player is in a game"
+    last = iso_to_ts((p or {}).get("lastOnline") or "")
+    last_text = f"<t:{last}:R>" if last else "Unknown"
+    r.add_field(
+        name="Status",
+        value=(
+            f"**Now:** {status_text}\n"
+            f"**Last online:** {last_text}\n"
+            f"**Joins:** {joins_text}"
+        ),
+        inline=True,
+    )
+
+    old_names = [h["name"] for h in (history or {}).get("data", [])]
+    if old_names:
+        r.add_field(name="Previous Usernames", value=_clean(", ".join(old_names), 300), inline=False)
+
+    about = _clean(user_json.get("description", ""), 400)
+    r.add_field(name="About", value=box(about or "No description"), inline=False)
+
+    linked_to = linked_discord_for_roblox(roblox_id)
+    r.add_field(name="Linked Discord", value=f"<@{linked_to}>" if linked_to else "Not linked to any Discord account", inline=False)
+    r.set_footer(text=f"{BOT_NAME} - Roblox privacy settings are not public, joins are inferred from presence")
+    return r
 
 
 # ======================================================
@@ -3186,7 +3723,7 @@ async def join_check(user_id: int):
     if result is None:
         return "skip", None  # Roblox failed; do not block the member
     p = result.get(link["roblox_id"])
-    if p and p.get("userPresenceType") == 2:
+    if presence_in_game(p):
         place_id = p.get("placeId") or p.get("rootPlaceId")
         job_id = p.get("gameId")
         if place_id and job_id:
@@ -3339,15 +3876,18 @@ async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
         description="These helpers joined this raid but were still not online when it ended:\n" + "\n".join(problems),
         color=0xED4245,
     )
-    embed.set_footer(text="Imperium")
+    embed.set_footer(text=BOT_NAME)
     await logs_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ======================================================
-# /see  (instant lookup, result goes to #snipe)
+# /see  (instant lookup)
+#   not in a game        -> says he is not in a server
+#   in game, joins on    -> everything: game, join link, region, full profile (also posted in #snipe)
+#   in game, joins off   -> the game he is playing + basic info only
 # ======================================================
 
-@bot.tree.command(name="see", description="Instantly find where a Roblox player is right now (posts the join link in #snipe)")
+@bot.tree.command(name="see", description="Find out if a Roblox player is in a server right now (full info when their joins are on)")
 @app_commands.describe(username="Roblox username to look up")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -3370,10 +3910,11 @@ async def see_command(interaction: discord.Interaction, username: str):
         )
 
     p = presences.get(roblox_id) or {}
-    in_game = p.get("userPresenceType") == 2 and (p.get("placeId") or p.get("rootPlaceId"))
-    if not in_game:
+
+    # ---- not in a server ----
+    if not presence_in_game(p):
         status = PRESENCE_NAMES.get(p.get("userPresenceType", 0), "Offline")
-        text = f"**{roblox_name}** is not in a game right now (status: **{status}**)."
+        text = f"**{roblox_name}** is **not in a server** right now (status: **{status}**)."
         last = iso_to_ts(p.get("lastOnline") or "")
         if last:
             text += f" Last online <t:{last}:R>."
@@ -3392,21 +3933,57 @@ async def see_command(interaction: discord.Interaction, username: str):
         "avatar_url": avatar,
         "added_by": interaction.user.id,
     }
-    info = await presence_to_info(p)
-    msg = await announce_found(t, info)
-    if msg:
-        await interaction.followup.send(f"Found **{roblox_name}**. Posted in {msg.channel.mention}.", ephemeral=True)
-    else:
-        await interaction.followup.send("Found them, but I could not post in #snipe. Check my permissions.", ephemeral=True)
+    joins_on = bool(p.get("gameId") and (p.get("placeId") or p.get("rootPlaceId")))
+
+    # ---- in a server, joins OFF / private: game + basic stuff only ----
+    if not joins_on:
+        info = await presence_to_info(p)
+        url = roblox_profile_url(roblox_id)
+        details = await roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}") or {}
+        created = iso_to_ts(details.get("created") or "")
+        embed = discord.Embed(title=f"{roblox_name} is in a server (joins off)", url=url, color=0xFEE75C)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+        embed.add_field(
+            name="Basic Info",
+            value=(
+                f"**Username:** `{roblox_name}`\n"
+                f"**Display name:** `{display_name or 'Unknown'}`\n"
+                f"**User ID:** `{roblox_id}`\n"
+                f"**Created:** {f'<t:{created}:R>' if created else 'Unknown'}\n"
+                f"**Profile:** [Open Profile]({url})"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Playing",
+            value=f"**Game:** {info['game']}\n**Joins:** Off or private server - no join link or server info is available",
+            inline=False,
+        )
+        embed.set_footer(text=f"{BOT_NAME} See")
+        return await interaction.followup.send(embed=embed, view=track_join_view(info), ephemeral=True)
+
+    # ---- in a server, joins ON: everything ----
+    info = await presence_to_info(p, with_region=True)
+    msg = await announce_found(t, info)  # alert + join button in #snipe
+    profile_embed = await build_roblox_embed(session, roblox_id, roblox_name)
+
+    found_embed = build_track_embed(t, info, "found")
+    if info.get("region") is None:
+        found_embed.add_field(name="Region", value="Could not detect", inline=True)
+
+    posted = f" Also posted in {msg.channel.mention}." if msg else ""
+    await interaction.followup.send(
+        f"**{roblox_name}** is **in a server** right now and their joins are on.{posted}",
+        embeds=[found_embed, profile_embed],
+        view=track_join_view(info),
+        ephemeral=True,
+    )
 
 
 # ======================================================
 # /whois  (owner only, PUBLIC reply)
 # ======================================================
-
-def _clean(text: str, limit: int) -> str:
-    return (text or "").replace("`", "'")[:limit]
-
 
 @bot.tree.command(name="whois", description="[OWN] Full Roblox profile and Discord info for a member or Roblox user")
 @app_commands.describe(member="Discord member to look up", roblox="Roblox username to look up")
@@ -3433,18 +4010,7 @@ async def whois_command(interaction: discord.Interaction, member: discord.Member
             if did:
                 member = guild.get_member(did)
     else:
-        link = DATA["links"].get(str(member.id))
-        if link:
-            roblox_id, roblox_name = link["roblox_id"], link["roblox_username"]
-        else:
-            name = saved_roblox_name(member.id)
-            if not name:
-                mine = [t for t in DATA["ticket_archive"].values() if t.get("requester_id") == member.id and t.get("roblox_username")]
-                mine.sort(key=lambda t: t.get("started_at", 0), reverse=True)
-                name = mine[0]["roblox_username"] if mine else None
-            found = await get_roblox_profile(session, name) if name else None
-            if found:
-                roblox_id, roblox_name = found
+        roblox_id, roblox_name = await resolve_roblox_for_member(session, member)
 
     embeds = []
 
@@ -3499,7 +4065,7 @@ async def whois_command(interaction: discord.Interaction, member: discord.Member
         bl = DATA["blacklist"].get(str(member.id))
         bl_text = ("Yes - " + _clean(bl.get("reason", ""), 150)) if bl else "No"
         d.add_field(
-            name="Imperium",
+            name=BOT_NAME,
             value=(
                 f"**Assists (server):** {get_raid_count(guild.id, member.id, 'server')}\n"
                 f"**Assists (global):** {get_raid_count(guild.id, member.id, 'global')}\n"
@@ -3509,91 +4075,12 @@ async def whois_command(interaction: discord.Interaction, member: discord.Member
             ),
             inline=False,
         )
-        d.set_footer(text="Imperium")
+        d.set_footer(text=BOT_NAME)
         embeds.append(d)
 
     # ---- Roblox info ----
     if roblox_id:
-        user_json, friends, followers, followings, history, groups, avatar, presences = await asyncio.gather(
-            roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}"),
-            roblox_json(session, f"https://friends.roblox.com/v1/users/{roblox_id}/friends/count"),
-            roblox_json(session, f"https://friends.roblox.com/v1/users/{roblox_id}/followers/count"),
-            roblox_json(session, f"https://friends.roblox.com/v1/users/{roblox_id}/followings/count"),
-            roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}/username-history", params={"limit": 10}),
-            roblox_json(session, f"https://groups.roblox.com/v2/users/{roblox_id}/groups/roles"),
-            roblox_avatar_url(session, roblox_id),
-            roblox_presence(session, [roblox_id]),
-        )
-        user_json = user_json or {}
-        created = iso_to_ts(user_json.get("created") or "")
-        url = roblox_profile_url(roblox_id)
-        created_text = f"<t:{created}:F> (<t:{created}:R>)" if created else "Unknown"
-
-        r = discord.Embed(title=f"Roblox - {user_json.get('name', roblox_name)}", url=url, color=EMBED_COLOR)
-        if avatar:
-            r.set_thumbnail(url=avatar)
-        r.add_field(
-            name="Profile",
-            value=(
-                f"**Username:** `{user_json.get('name', roblox_name)}`\n"
-                f"**Display name:** `{user_json.get('displayName', 'Unknown')}`\n"
-                f"**User ID:** `{roblox_id}`\n"
-                f"**Created:** {created_text}\n"
-                f"**Verified badge:** {'Yes' if user_json.get('hasVerifiedBadge') else 'No'}\n"
-                f"**Banned:** {'Yes' if user_json.get('isBanned') else 'No'}\n"
-                f"**Profile:** [Open Profile]({url})"
-            ),
-            inline=False,
-        )
-        r.add_field(
-            name="Social",
-            value=(
-                f"**Friends:** {(friends or {}).get('count', '?')}\n"
-                f"**Followers:** {(followers or {}).get('count', '?')}\n"
-                f"**Following:** {(followings or {}).get('count', '?')}\n"
-                f"**Groups:** {len((groups or {}).get('data', [])) if groups else '?'}"
-            ),
-            inline=True,
-        )
-
-        # Presence + join setting (Roblox does not expose privacy settings, so joins are inferred)
-        p = (presences or {}).get(roblox_id)
-        if presences is None:
-            status_text = "Unknown (set a valid ROBLOX_COOKIE to see this)"
-            joins_text = "Unknown"
-        else:
-            p = p or {}
-            ptype = p.get("userPresenceType", 0)
-            status_text = PRESENCE_NAMES.get(ptype, "Offline")
-            if ptype == 2:
-                game = await roblox_game_name(session, p.get("universeId"), p.get("lastLocation"))
-                status_text += f" - {game}"
-                joins_text = "Everyone / allowed (joinable server)" if p.get("gameId") else "Off or private (no join link available)"
-            else:
-                joins_text = "Only visible while the player is in a game"
-        last = iso_to_ts((p or {}).get("lastOnline") or "")
-        last_text = f"<t:{last}:R>" if last else "Unknown"
-        r.add_field(
-            name="Status",
-            value=(
-                f"**Now:** {status_text}\n"
-                f"**Last online:** {last_text}\n"
-                f"**Joins:** {joins_text}"
-            ),
-            inline=True,
-        )
-
-        old_names = [h["name"] for h in (history or {}).get("data", [])]
-        if old_names:
-            r.add_field(name="Previous Usernames", value=_clean(", ".join(old_names), 300), inline=False)
-
-        about = _clean(user_json.get("description", ""), 400)
-        r.add_field(name="About", value=box(about or "No description"), inline=False)
-
-        linked_to = linked_discord_for_roblox(roblox_id)
-        r.add_field(name="Linked Discord", value=f"<@{linked_to}>" if linked_to else "Not linked to any Discord account", inline=False)
-        r.set_footer(text="Imperium - Roblox privacy settings are not public, joins are inferred from presence")
-        embeds.append(r)
+        embeds.append(await build_roblox_embed(session, roblox_id, roblox_name))
     elif member is not None:
         embeds.append(discord.Embed(
             description=f"No Roblox account found for {member.mention}. They have not linked one or made a request yet.",
@@ -3601,6 +4088,103 @@ async def whois_command(interaction: discord.Interaction, member: discord.Member
         ))
 
     await interaction.followup.send(embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ======================================================
+# /frnd request  (owner only)
+#   Roblox: friend request from the bot's Roblox account (ROBLOX_COOKIE).
+#   Discord: bots are not allowed to send friend requests, so the member gets a DM
+#            with a button that opens your profile so they can add you.
+# ======================================================
+
+frnd_group = app_commands.Group(name="frnd", description="[OWN] Friend requests", guild_only=True)
+
+
+async def send_roblox_friend_request(session: aiohttp.ClientSession, target_roblox_id: int):
+    """Returns (ok, message)."""
+    if not ROBLOX_COOKIE:
+        return False, "No ROBLOX_COOKIE is set, so I cannot send Roblox friend requests."
+    status, data, headers = await roblox_authed_post(
+        session,
+        f"https://friends.roblox.com/v1/users/{target_roblox_id}/request-friendship",
+        {"friendshipOriginSourceType": 0},
+    )
+    if status is None:
+        return False, "Could not reach Roblox."
+    if status == 200 and isinstance(data, dict) and data.get("success"):
+        return True, "Friend request sent."
+    if status == 401:
+        return False, "The bot's ROBLOX_COOKIE is invalid or expired."
+    if status == 403 and any(k.lower().startswith("rblx-challenge") for k in headers):
+        return False, "Roblox asked for a captcha / verification, so it blocked the request. Send it manually from the bot's Roblox account once."
+    errors = (data or {}).get("errors") if isinstance(data, dict) else None
+    if errors:
+        return False, f"Roblox refused: {errors[0].get('message', 'unknown error')}"
+    if isinstance(data, dict) and data.get("isCaptchaRequired"):
+        return False, "Roblox requires a captcha for this request."
+    return False, f"Roblox refused the request (HTTP {status})."
+
+
+@frnd_group.command(name="request", description="[OWN] Send a friend request on Roblox (and a Discord friend DM) to a person")
+@app_commands.describe(member="Discord member (their linked/saved Roblox account is used)", roblox="Roblox username (if no member, or to override)")
+async def frnd_request(interaction: discord.Interaction, member: discord.Member = None, roblox: str = None):
+    if not await require_owner(interaction):
+        return
+    if member is None and not roblox:
+        return await interaction.response.send_message("Give a Discord member, a Roblox username, or both.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    session = interaction.client.session
+    lines = []
+
+    # ---- Roblox ----
+    roblox_id = roblox_name = None
+    if roblox:
+        found = await get_roblox_profile(session, roblox.strip().lstrip("@"))
+        if found:
+            roblox_id, roblox_name = found
+        else:
+            lines.append(f"**Roblox:** I could not find an account named **{roblox}**.")
+    elif member is not None:
+        roblox_id, roblox_name = await resolve_roblox_for_member(session, member)
+        if not roblox_id:
+            lines.append(f"**Roblox:** no Roblox account is linked or saved for {member.mention}. Give a username in the `roblox` option.")
+
+    if roblox_id:
+        ok, msg = await send_roblox_friend_request(session, roblox_id)
+        lines.append(f"**Roblox ({roblox_name}):** {msg}")
+
+    # ---- Discord ----
+    if member is not None:
+        if member.bot:
+            lines.append("**Discord:** that member is a bot.")
+        else:
+            embed = discord.Embed(
+                title="Friend request",
+                description=(
+                    f"<@{interaction.user.id}> from **{interaction.guild.name}** would like to be your friend. "
+                    "Press the button below to open their profile and add them."
+                ),
+                color=EMBED_COLOR,
+            )
+            view = discord.ui.View(timeout=None)
+            view.add_item(discord.ui.Button(label="Open Profile", style=discord.ButtonStyle.link, url=f"https://discord.com/users/{DEVELOPER_ID}"))
+            try:
+                await member.send(embed=embed, view=view)
+                lines.append(
+                    "**Discord:** Discord does not let bots send friend requests, so I DMed them a button that opens your profile. "
+                    "They (or you, from their profile) still have to press Add Friend."
+                )
+            except discord.HTTPException:
+                lines.append(
+                    "**Discord:** Discord does not let bots send friend requests and their DMs are closed. "
+                    f"Add them yourself: <@{member.id}> (`{member.id}`)."
+                )
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+bot.tree.add_command(frnd_group)
 
 
 # ======================================================
@@ -3620,13 +4204,13 @@ async def tickets_export_command(interaction: discord.Interaction, all_servers: 
     payload = json.dumps(rows, indent=2).encode("utf-8")
     await interaction.response.send_message(
         f"{len(rows)} ticket(s) in the archive.",
-        file=discord.File(io.BytesIO(payload), filename="imperium_tickets.json"),
+        file=discord.File(io.BytesIO(payload), filename="cruxer_tickets.json"),
         ephemeral=True,
     )
 
 
 # ======================================================
-# NEW SERVER / READY
+# NEW SERVER / REMOVED / READY
 # ======================================================
 
 @bot.event
@@ -3642,29 +4226,75 @@ async def on_guild_join(guild: discord.Guild):
 
 
 @bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"Connected to {len(bot.guilds)} server(s).")
+async def on_guild_remove(guild: discord.Guild):
+    """Fires after the bot is gone from a server. If it left on purpose the farewell channel was already
+    created. If it was KICKED/BANNED it no longer has any access, so a channel is impossible - the best
+    we can do is DM the server owner and the developer."""
+    print(f"Removed from server: {guild.name} ({guild.id})")
+    if guild.id in _self_leaving:
+        _self_leaving.discard(guild.id)
+        return
 
-    global _commands_synced
+    if guild.owner_id:
+        try:
+            owner = bot.get_user(guild.owner_id) or await bot.fetch_user(guild.owner_id)
+            await owner.send(embed=build_farewell_embed(guild.name))
+        except discord.HTTPException:
+            pass
+    try:
+        dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
+        await dev.send(f"{BOT_NAME} was removed from **{guild.name}** (`{guild.id}`) without using /deauthorize.")
+    except discord.HTTPException:
+        pass
+
+
+_ready_done = False
+
+
+@bot.event
+async def on_ready():
+    global _commands_synced, _ready_done
+
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Connected to {len(bot.guilds)} server(s). Global leaderboard entries loaded: {len(DATA['stats']['global'])}")
+
+    # on_ready also fires on every reconnect - only do the setup once.
+    if _ready_done:
+        return
+    _ready_done = True
+
+    cookie_ok, cookie_text = await roblox_cookie_status(bot.session)
+    print(f"[{BOT_NAME}] Roblox account check: {'OK' if cookie_ok else 'PROBLEM'} - {cookie_text}")
+
     if not _commands_synced:
         _commands_synced = True
         await sync_all_commands()
 
     for guild in bot.guilds:
+        gid = str(guild.id)
+
         # Authorized servers always get a #snipe channel (hitlist / see alerts only go there).
         if guild.id in DATA["authorized_guilds"]:
             await ensure_snipe_channel(guild)
 
-        panel_channel = guild.get_channel(BATTLE_PANEL_CHANNEL_ID) or discord.utils.get(guild.text_channels, name=BATTLE_PANEL_CHANNEL_NAME)
-        if panel_channel:
+        # Prefer the channel where the panel/leaderboard currently lives (it may have been moved with /add).
+        panel_channel = (
+            guild.get_channel(DATA["panel_channels"].get(gid, 0))
+            or guild.get_channel(BATTLE_PANEL_CHANNEL_ID)
+            or discord.utils.get(guild.text_channels, name=BATTLE_PANEL_CHANNEL_NAME)
+        )
+        if isinstance(panel_channel, discord.TextChannel):
             try:
                 await refresh_panel(panel_channel)
             except discord.HTTPException:
                 pass
 
-        leaderboard_channel = guild.get_channel(LEADERBOARD_CHANNEL_ID) or discord.utils.get(guild.text_channels, name=LEADERBOARD_CHANNEL_NAME)
-        if leaderboard_channel:
+        leaderboard_channel = (
+            guild.get_channel(DATA["leaderboard_channels"].get(gid, 0))
+            or guild.get_channel(LEADERBOARD_CHANNEL_ID)
+            or discord.utils.get(guild.text_channels, name=LEADERBOARD_CHANNEL_NAME)
+        )
+        if isinstance(leaderboard_channel, discord.TextChannel):
             try:
                 await refresh_leaderboard(leaderboard_channel)
             except discord.HTTPException:
