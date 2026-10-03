@@ -59,7 +59,7 @@ Changes in this version (latest first):
   - Renamed Imperium -> Cruxer everywhere (old category/data file still recognised)
   - Request limit is a 24 hour window that starts at the member's first request
   - "Dispatched Successfully" info card after a request is created
-  - /frnd request, /see, /hitlist add profile, region auto-detect, farewell channel
+  - /frnd request, /see, /hitlist add profile, region auto-detect
   - Atomic data file with .bak backup, corrupt file moved aside
   - Requests need an existing Roblox profile AND a joinable game; verified join link stored
   - One panel/leaderboard copy per channel, on_ready setup runs once
@@ -124,7 +124,6 @@ LOGS_CHANNEL_NAME = "logs"
 MVPS_CHANNEL_NAME = "mvps"
 SNIPE_CHANNEL_NAME = "snipe"
 README_CHANNEL_NAME = "read-me"
-FAREWELL_CHANNEL_NAME = "cruxer-farewell"
 
 SUPPORT_SERVER_INVITE = None
 
@@ -707,7 +706,7 @@ def spawn(coro):
 # ======================================================
 
 async def create_or_update_readme(guild: discord.Guild, authorized: bool):
-    """Create/update exactly one Cruxer read-me channel per guild."""
+    """Create/update exactly one #read-me channel per guild and remove duplicates."""
     lock = _readme_locks.setdefault(guild.id, asyncio.Lock())
     async with lock:
         try:
@@ -724,18 +723,19 @@ async def create_or_update_readme(guild: discord.Guild, authorized: bool):
                 channels[0] if channels else None,
             )
 
-            # Remove duplicate Cruxer-owned read-me channels.
+            # Keep exactly ONE #read-me channel in this guild.
+            # Delete every other channel with the same name, regardless of its topic,
+            # so old/duplicate Cruxer read-me channels cannot accumulate.
             if existing:
                 for duplicate in channels:
                     if duplicate.id == existing.id:
                         continue
-                    if (duplicate.topic or "").lower() == f"information about {BOT_NAME}".lower():
-                        try:
-                            await duplicate.delete(
-                                reason=f"{BOT_NAME}: remove duplicate read-me channel"
-                            )
-                        except (discord.Forbidden, discord.HTTPException):
-                            pass
+                    try:
+                        await duplicate.delete(
+                            reason=f"{BOT_NAME}: keep exactly one read-me channel"
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
 
             embed = build_readme_embed(guild, authorized)
             view = discord.ui.View(timeout=None)
@@ -817,59 +817,6 @@ def build_readme_embed(guild: discord.Guild, authorized: bool) -> discord.Embed:
     embed.add_field(name="Status", value="Authorized" if authorized else "Unauthorized", inline=True)
     embed.set_footer(text=BOT_NAME)
     return embed
-
-
-# ======================================================
-# FAREWELL (when the bot is removed)
-# ======================================================
-
-def build_farewell_embed(guild_name: str) -> discord.Embed:
-    return discord.Embed(
-        title=f"Goodbye from {BOT_NAME}",
-        description=(
-            f"{BOT_NAME} has left **{guild_name}**.\n\n"
-            "Thank you for using the bot and for every raid you coordinated with it. "
-            f"If you want {BOT_NAME} back, or have any questions, contact the developer: <@{DEVELOPER_ID}>."
-        ),
-        color=EMBED_COLOR,
-    )
-
-
-async def send_farewell(guild: discord.Guild):
-    """Create a read-only farewell channel and post the goodbye message (used right before the bot leaves)."""
-    try:
-        channel = discord.utils.find(
-            lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == FAREWELL_CHANNEL_NAME,
-            guild.text_channels,
-        )
-        if channel is None:
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True),
-            }
-            channel = await guild.create_text_channel(
-                name=FAREWELL_CHANNEL_NAME,
-                overwrites=overwrites,
-                topic=f"A goodbye from {BOT_NAME}",
-                reason=f"{BOT_NAME} farewell",
-            )
-        await channel.send(embed=build_farewell_embed(guild.name))
-        return channel
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        print(f"[{BOT_NAME}] Could not create the farewell channel in {guild.name}: {exc}")
-        return None
-
-
-_self_leaving: set[int] = set()  # servers the bot is leaving on purpose (farewell already sent)
-
-
-async def leave_with_farewell(guild: discord.Guild):
-    await send_farewell(guild)
-    _self_leaving.add(guild.id)
-    try:
-        await guild.leave()
-    except discord.HTTPException:
-        _self_leaving.discard(guild.id)
 
 
 # ======================================================
@@ -2821,7 +2768,7 @@ async def deauthorize_command(interaction: discord.Interaction):
     except discord.HTTPException:
         pass
 
-    await leave_with_farewell(guild)  # creates the farewell channel + message, then leaves
+    await guild.leave()
 
 
 # ======================================================
@@ -3010,7 +2957,7 @@ class ConfirmLeaveView(discord.ui.View):
         save_data()
 
         await interaction.response.edit_message(content=f"{BOT_NAME} has been removed from **{name}**.", view=None)
-        await leave_with_farewell(target)  # farewell channel + message first, then leave
+        await target.leave()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -5486,25 +5433,8 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
-    """Fires after the bot is gone from a server. If it left on purpose the farewell channel was already
-    created. If it was KICKED/BANNED it no longer has any access, so a channel is impossible - the best
-    we can do is DM the server owner and the developer."""
+    # No farewell messages, DMs, or farewell channels.
     print(f"Removed from server: {guild.name} ({guild.id})")
-    if guild.id in _self_leaving:
-        _self_leaving.discard(guild.id)
-        return
-
-    if guild.owner_id:
-        try:
-            owner = bot.get_user(guild.owner_id) or await bot.fetch_user(guild.owner_id)
-            await owner.send(embed=build_farewell_embed(guild.name))
-        except discord.HTTPException:
-            pass
-    try:
-        dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
-        await dev.send(f"{BOT_NAME} was removed from **{guild.name}** (`{guild.id}`) without using /deauthorize.")
-    except discord.HTTPException:
-        pass
 
 
 _ready_done = False
