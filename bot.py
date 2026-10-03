@@ -542,6 +542,7 @@ async def delete_previous(channel: discord.TextChannel, msg_key: str, chan_key: 
 # ---- finding / removing old panels and leaderboards (current AND legacy embed ones) ----
 
 _refresh_locks: dict[str, asyncio.Lock] = {}
+_readme_locks: dict[int, asyncio.Lock] = {}
 
 PURGE_KEYS = {
     "panel": ("panel_messages", "panel_channels"),
@@ -676,6 +677,22 @@ class BlacklistGate:
 
 # background tasks must be referenced or Python may garbage-collect them mid-run
 _bg_tasks: set = set()
+_processed_prefix_messages: dict[int, float] = {}
+_PREFIX_DEDUPE_SECONDS = 10
+
+
+def mark_prefix_message_seen(message_id: int) -> bool:
+    now = time.time()
+    stale = [
+        mid for mid, ts in _processed_prefix_messages.items()
+        if now - ts > _PREFIX_DEDUPE_SECONDS
+    ]
+    for mid in stale:
+        _processed_prefix_messages.pop(mid, None)
+    if message_id in _processed_prefix_messages:
+        return False
+    _processed_prefix_messages[message_id] = now
+    return True
 
 
 def spawn(coro):
@@ -690,40 +707,89 @@ def spawn(coro):
 # ======================================================
 
 async def create_or_update_readme(guild: discord.Guild, authorized: bool):
-    existing = discord.utils.find(
-        lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == README_CHANNEL_NAME,
-        guild.text_channels,
-    )
+    """Create/update exactly one Cruxer read-me channel per guild."""
+    lock = _readme_locks.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        try:
+            channels = [
+                c for c in guild.text_channels
+                if c.name.lower() == README_CHANNEL_NAME
+            ]
 
-    embed = build_readme_embed(guild, authorized)
-    view = discord.ui.View(timeout=None)
-    if SUPPORT_SERVER_INVITE:
-        view.add_item(discord.ui.Button(label="Support Server", style=discord.ButtonStyle.link, url=SUPPORT_SERVER_INVITE))
-    view.add_item(discord.ui.Button(label="Open Developer Profile", style=discord.ButtonStyle.link, url=f"https://discord.com/users/{DEVELOPER_ID}"))
+            existing = next(
+                (
+                    c for c in channels
+                    if (c.topic or "").lower() == f"information about {BOT_NAME}".lower()
+                ),
+                channels[0] if channels else None,
+            )
 
-    try:
-        if existing:
-            async for msg in existing.history(limit=10):
-                if msg.author == guild.me and msg.embeds:
-                    await msg.edit(embed=embed, view=view)
-                    return existing
-            await existing.send(embed=embed, view=view)
-            return existing
+            # Remove duplicate Cruxer-owned read-me channels.
+            if existing:
+                for duplicate in channels:
+                    if duplicate.id == existing.id:
+                        continue
+                    if (duplicate.topic or "").lower() == f"information about {BOT_NAME}".lower():
+                        try:
+                            await duplicate.delete(
+                                reason=f"{BOT_NAME}: remove duplicate read-me channel"
+                            )
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_channels=True),
-        }
-        channel = await guild.create_text_channel(
-            name=README_CHANNEL_NAME,
-            overwrites=overwrites,
-            topic=f"Information about {BOT_NAME}",
-            reason=f"{BOT_NAME} Read-me channel",
-        )
-        await channel.send(embed=embed, view=view)
-        return channel
-    except discord.Forbidden:
-        return None
+            embed = build_readme_embed(guild, authorized)
+            view = discord.ui.View(timeout=None)
+            if SUPPORT_SERVER_INVITE:
+                view.add_item(
+                    discord.ui.Button(
+                        label="Support Server",
+                        style=discord.ButtonStyle.link,
+                        url=SUPPORT_SERVER_INVITE,
+                    )
+                )
+            view.add_item(
+                discord.ui.Button(
+                    label="Open Developer Profile",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://discord.com/users/{DEVELOPER_ID}",
+                )
+            )
+
+            if existing:
+                async for msg in existing.history(limit=20):
+                    if msg.author == guild.me and msg.embeds:
+                        await msg.edit(embed=embed, view=view)
+                        return existing
+                await existing.send(embed=embed, view=view)
+                return existing
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True,
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    embed_links=True,
+                    manage_channels=True,
+                ),
+            }
+            channel = await guild.create_text_channel(
+                name=README_CHANNEL_NAME,
+                overwrites=overwrites,
+                topic=f"Information about {BOT_NAME}",
+                reason=f"{BOT_NAME} Read-me channel",
+            )
+            await channel.send(embed=embed, view=view)
+            return channel
+
+        except discord.Forbidden:
+            return None
+        except discord.HTTPException as exc:
+            print(f"[{BOT_NAME}] Could not create/update Read-me in {guild.name}: {exc}")
+            return None
 
 
 def build_readme_embed(guild: discord.Guild, authorized: bool) -> discord.Embed:
@@ -2342,7 +2408,7 @@ async def prefix_blacklist_check(ctx: commands.Context) -> bool:
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     # ".something" in normal chat is not a command - never spam the console or the channel.
-    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure, commands.CommandOnCooldown)):
         return
     print(f"[{BOT_NAME}] Prefix command error in {getattr(ctx.command, 'name', '?')}: {error!r}")
 
@@ -2514,8 +2580,11 @@ async def resolve_prefix_target(ctx: commands.Context, text: str | None):
 
 
 @bot.command(name="av", aliases=["avatar", "pfp"])
+@commands.cooldown(1, 2.0, commands.BucketType.user)
 async def av_command(ctx: commands.Context, *, target: str = None):
     """.av [user]  - avatar (all formats), banner and profile of a user."""
+    if not mark_prefix_message_seen(ctx.message.id):
+        return
     user = await resolve_prefix_target(ctx, target)
     if user is None:
         return await ctx.reply("I could not find that user. Mention them or give their ID.", mention_author=False)
@@ -3421,16 +3490,20 @@ def presence_sig(p) -> str:
 
 
 async def roblox_presence(session: aiohttp.ClientSession, user_ids: list[int]):
-    """Returns {user_id: presence_dict} or None if Roblox refused / failed."""
+    """Return {user_id: presence_dict}, retrying transient Roblox failures."""
     global _roblox_csrf, _presence_warned
+
+    if session is None:
+        return None
 
     headers = {"Content-Type": "application/json"}
     if ROBLOX_COOKIE:
         headers["Cookie"] = f".ROBLOSECURITY={ROBLOX_COOKIE}"
 
-    for _ in range(2):
+    for attempt in range(3):
         if _roblox_csrf:
             headers["X-CSRF-TOKEN"] = _roblox_csrf
+
         try:
             async with session.post(
                 "https://presence.roblox.com/v1/presence/users",
@@ -3441,20 +3514,44 @@ async def roblox_presence(session: aiohttp.ClientSession, user_ids: list[int]):
                 if resp.status == 403 and resp.headers.get("x-csrf-token"):
                     _roblox_csrf = resp.headers["x-csrf-token"]
                     continue
-                if resp.status != 200:
-                    if not _presence_warned:
-                        _presence_warned = True
-                        print(
-                            f"[{BOT_NAME}] Roblox presence returned HTTP {resp.status}. "
-                            "Set a valid ROBLOX_COOKIE in your .env to enable /hitlist and /see."
-                        )
-                    return None
-                _presence_warned = False
-                data = await resp.json()
-                return {p["userId"]: p for p in data.get("userPresences", [])}
+
+                if resp.status == 200:
+                    _presence_warned = False
+                    data = await resp.json(content_type=None)
+                    return {
+                        p["userId"]: p
+                        for p in data.get("userPresences", [])
+                        if "userId" in p
+                    }
+
+                if resp.status == 429 or 500 <= resp.status < 600:
+                    if attempt < 2:
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            delay = min(float(retry_after), 3.0) if retry_after else 0.8 * (attempt + 1)
+                        except (TypeError, ValueError):
+                            delay = 0.8 * (attempt + 1)
+                        await asyncio.sleep(delay)
+                        continue
+
+                if not _presence_warned:
+                    _presence_warned = True
+                    print(
+                        f"[{BOT_NAME}] Roblox presence returned HTTP {resp.status}. "
+                        "Set a valid ROBLOX_COOKIE in your .env to enable /hitlist and /see."
+                    )
+                return None
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt < 2:
+                await asyncio.sleep(0.8 * (attempt + 1))
+                continue
+            print(f"[{BOT_NAME}] Roblox presence request failed: {exc}")
+            return None
         except Exception as exc:
             print(f"[{BOT_NAME}] Roblox presence request failed: {exc}")
             return None
+
     return None
 
 
@@ -4866,91 +4963,132 @@ async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
 async def see_command(interaction: discord.Interaction, username: str):
     if not await require_admin(interaction):
         return
+
     await interaction.response.defer(ephemeral=True)
     session = interaction.client.session
-
-    roblox = await get_roblox_profile(session, username.strip().lstrip("@"))
-    if not roblox:
-        return await interaction.followup.send(f"I could not find a Roblox account named **{username}**.", ephemeral=True)
-    roblox_id, roblox_name = roblox
-
-    presences = await roblox_presence(session, [roblox_id])
-    if presences is None:
+    if session is None:
         return await interaction.followup.send(
-            "Roblox refused the presence check. Make sure a valid ROBLOX_COOKIE is set in the bot's .env.",
+            "Roblox lookup is still starting up. Try /see again in a few seconds.",
             ephemeral=True,
         )
 
-    p = presences.get(roblox_id) or {}
+    typed_username = username.strip().lstrip("@")
 
-    # ---- not in a server ----
-    if not presence_in_game(p):
-        status = PRESENCE_NAMES.get(p.get("userPresenceType", 0), "Offline")
-        text = f"**{roblox_name}** is **not in a server** right now (status: **{status}**)."
-        last = iso_to_ts(p.get("lastOnline") or "")
-        if last:
-            text += f" Last online <t:{last}:R>."
-        text += "\nUse `/hitlist add` to be alerted the moment they join."
-        return await interaction.followup.send(text, ephemeral=True)
+    try:
+        roblox = await get_roblox_profile(session, typed_username)
+        if not roblox:
+            return await interaction.followup.send(
+                f"I could not find a Roblox account named **{username}**.",
+                ephemeral=True,
+            )
 
-    display_name, _ = await roblox_user_details(session, roblox_id)
-    avatar = await roblox_avatar_url(session, roblox_id)
-    t = {
-        "kind": "hitlist",
-        "guild_id": interaction.guild.id,
-        "channel_id": interaction.channel_id,
-        "roblox_id": roblox_id,
-        "username": roblox_name,
-        "display_name": display_name,
-        "avatar_url": avatar,
-        "added_by": interaction.user.id,
-    }
-    joins_on = bool(p.get("gameId") and (p.get("placeId") or p.get("rootPlaceId")))
+        roblox_id, roblox_name = roblox
+        presences = await roblox_presence(session, [roblox_id])
 
-    # ---- in a server, joins OFF / private: game + basic stuff only ----
-    if not joins_on:
-        info = await presence_to_info(p)
-        url = roblox_profile_url(roblox_id)
-        details = await roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}") or {}
-        created = iso_to_ts(details.get("created") or "")
-        embed = discord.Embed(title=f"{roblox_name} is in a server (joins off)", url=url, color=0xFEE75C)
-        if avatar:
-            embed.set_thumbnail(url=avatar)
-        embed.add_field(
-            name="Basic Info",
-            value=(
-                f"**Username:** `{roblox_name}`\n"
-                f"**Display name:** `{display_name or 'Unknown'}`\n"
-                f"**User ID:** `{roblox_id}`\n"
-                f"**Created:** {f'<t:{created}:R>' if created else 'Unknown'}\n"
-                f"**Profile:** [Open Profile]({url})"
+        if presences is None:
+            return await interaction.followup.send(
+                "Roblox did not return a presence result after a few attempts. "
+                "Try `/see` again in a moment. If this keeps happening, check ROBLOX_COOKIE.",
+                ephemeral=True,
+            )
+
+        p = presences.get(roblox_id) or {}
+
+        if not presence_in_game(p):
+            status = PRESENCE_NAMES.get(p.get("userPresenceType", 0), "Offline")
+            result = f"**{roblox_name}** is **not in a server** right now (status: **{status}**)."
+            last = iso_to_ts(p.get("lastOnline") or "")
+            if last:
+                result += f" Last online <t:{last}:R>."
+            result += "\nUse `/hitlist add` to be alerted the moment they join."
+            return await interaction.followup.send(result, ephemeral=True)
+
+        display_name, _ = await roblox_user_details(session, roblox_id)
+        avatar = await roblox_avatar_url(session, roblox_id)
+        t = {
+            "kind": "hitlist",
+            "guild_id": interaction.guild.id,
+            "channel_id": interaction.channel_id,
+            "roblox_id": roblox_id,
+            "username": roblox_name,
+            "display_name": display_name,
+            "avatar_url": avatar,
+            "added_by": interaction.user.id,
+        }
+        joins_on = bool(p.get("gameId") and (p.get("placeId") or p.get("rootPlaceId")))
+
+        if not joins_on:
+            info = await presence_to_info(p)
+            url = roblox_profile_url(roblox_id)
+            details = await roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}") or {}
+            created = iso_to_ts(details.get("created") or "")
+            embed = discord.Embed(
+                title=f"{roblox_name} is in a server (joins off)",
+                url=url,
+                color=0xFEE75C,
+            )
+            if avatar:
+                embed.set_thumbnail(url=avatar)
+            embed.add_field(
+                name="Basic Info",
+                value=(
+                    f"**Username:** `{roblox_name}`\n"
+                    f"**Display name:** `{display_name or 'Unknown'}`\n"
+                    f"**User ID:** `{roblox_id}`\n"
+                    f"**Created:** {f'<t:{created}:R>' if created else 'Unknown'}\n"
+                    f"**Profile:** [Open Profile]({url})"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="Playing",
+                value=(
+                    f"**Game:** {info['game']}\n"
+                    "**Joins:** Off or private server - no join link or server info is available"
+                ),
+                inline=False,
+            )
+            embed.set_footer(text=f"{BOT_NAME} See")
+            return await interaction.followup.send(
+                embed=embed,
+                view=track_join_view(info),
+                ephemeral=True,
+            )
+
+        info = await presence_to_info(p, with_region=True)
+        profile_embed = await build_roblox_embed(session, roblox_id, roblox_name)
+        found_embed = build_track_embed(t, info, "found")
+        if info.get("region") is None:
+            found_embed.add_field(name="Region", value="Could not detect", inline=True)
+
+        return await interaction.followup.send(
+            content=(
+                f"**{roblox_name}** is **in a server** right now and their joins are on. "
+                "The full result is shown below."
             ),
-            inline=False,
+            embeds=[found_embed, profile_embed],
+            view=track_join_view(info),
+            ephemeral=True,
         )
-        embed.add_field(
-            name="Playing",
-            value=f"**Game:** {info['game']}\n**Joins:** Off or private server - no join link or server info is available",
-            inline=False,
+
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        print(f"[{BOT_NAME}] /see Roblox request failed for {typed_username}: {exc}")
+        return await interaction.followup.send(
+            "The Roblox lookup timed out. Please try `/see` again in a moment.",
+            ephemeral=True,
         )
-        embed.set_footer(text=f"{BOT_NAME} See")
-        return await interaction.followup.send(embed=embed, view=track_join_view(info), ephemeral=True)
-
-    # ---- in a server, joins ON: everything ----
-    info = await presence_to_info(p, with_region=True)
-    msg = await announce_found(t, info)  # alert + join button in #snipe
-    profile_embed = await build_roblox_embed(session, roblox_id, roblox_name)
-
-    found_embed = build_track_embed(t, info, "found")
-    if info.get("region") is None:
-        found_embed.add_field(name="Region", value="Could not detect", inline=True)
-
-    posted = f" Also posted in {msg.channel.mention}." if msg else ""
-    await interaction.followup.send(
-        f"**{roblox_name}** is **in a server** right now and their joins are on.{posted}",
-        embeds=[found_embed, profile_embed],
-        view=track_join_view(info),
-        ephemeral=True,
-    )
+    except discord.HTTPException as exc:
+        print(f"[{BOT_NAME}] /see Discord response failed: {exc}")
+        return await interaction.followup.send(
+            "I found the player, but Discord could not send the result. Please try `/see` again.",
+            ephemeral=True,
+        )
+    except Exception as exc:
+        print(f"[{BOT_NAME}] /see unexpected error for {typed_username}: {exc!r}")
+        return await interaction.followup.send(
+            "Something went wrong while checking that player. Please try `/see` again.",
+            ephemeral=True,
+        )
 
 
 # ======================================================
