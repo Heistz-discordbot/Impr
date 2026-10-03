@@ -9,7 +9,8 @@ the Discord Developer Portal (Bot tab).
 
 The bot also needs these server permissions to use every feature below:
 Manage Channels, Manage Roles, Manage Webhooks, Manage Guild (for invites),
-Kick Members, View Audit Log, Embed Links, Attach Files, Read Message History.
+Kick Members, View Audit Log, Embed Links, Attach Files, Read Message History,
+Create Instant Invite (for /nuke-restore to recreate invites).
 
 Data (raid numbers, ticket info, stats, panel/leaderboard message ids,
 rate limits, win streaks, saved configuration, the permanent ticket archive)
@@ -20,6 +21,13 @@ your .env to store it somewhere else, for example a persistent volume on your
 host - if your host wipes files on every redeploy, you MUST do this or the
 global leaderboard will reset.
 
+GLOBAL LEADERBOARD HISTORY is now protected three ways:
+  1) a second file (cruxer_global.json, or CRUXER_GLOBAL_FILE) that holds only the global
+     totals + the full raid history and is merged back in on every start
+  2) it is rebuilt from the permanent ticket archive if the totals ever fall behind
+  3) the bot DMs the developer a backup file every 6 hours (and on start-up). If your host
+     wipes the disk, upload the latest one with /data-restore and nothing is lost.
+
 Roblox features (/hitlist, /see, /whois, /frnd, join checks, helper warnings,
 request verification, automatic server link + region) need ROBLOX_COOKIE in
 your .env - the .ROBLOSECURITY cookie of a Roblox account (use a spare/alt
@@ -27,41 +35,44 @@ account, never your main). Roblox's presence API refuses anonymous requests.
 
 Optional .env values:
   RALVORA_API_URL / RALVORA_API_KEY  - a region API to try first (see detect_server_region)
+  CRUXER_GLOBAL_FILE                 - where the extra global-leaderboard file lives
 
 Changes in this version (latest first):
-  - Renamed Imperium -> Cruxer everywhere (old category/data file still recognised)
-  - Request limit is now a 24 hour window that starts at the member's first
-    request (3pm today -> 3pm tomorrow), then resets
-  - After a request is created the member gets a "Dispatched Successfully"
-    info card (ticket channel, usage status, when the limit resets)
-  - /frnd request (owner): Roblox friend request from the bot's Roblox account +
-    a Discord DM with a link to add the developer (bots cannot send Discord
-    friend requests)
-  - /see: tells you if the player is in a server; joins on = full info, join
-    link and server region; joins off = game + basic info only
-  - /hitlist add: shows the target's whole Roblox profile; if the target is
-    already in a server the alert is sent immediately
-  - Server region is auto-detected (leave the region box empty) and members who
-    linked their Roblox account are no longer asked for a server link - it is
-    taken from the server they are in right now
-  - When the bot is removed with /deauthorize or /bot stats a farewell channel
-    is created first; if it is kicked, the server owner gets a farewell DM
-    (a kicked bot has no access left to create a channel)
+  - .av [user]  (prefix command, also .avatar / .pfp): avatar + profile of a user
+  - /anti-nuke (was /antinuke) now records everything it locks / deletes / revokes, and
+    /nuke-restore puts the channels, locks and invites back
+  - /hitlist add is instant: runs every lookup in parallel, posts the alert straight away if
+    the target is already in a server, fills in the region afterwards, polls every 10s
+  - /bot stats can now show the stats of ANY server the bot is in (dropdown, paged) and still
+    remove the bot from any of them; shows missing permissions per server
+  - Old/legacy (embed) panels are removed automatically on every start and refresh
+  - /purge keeps only the newest working panel (or leaderboard) and deletes the older ones
+  - Global leaderboard history is permanent (see above); /data-backup and /data-restore
+  - /nuke -> "This guy thought he's him lol."
+  - /raid panel and /backup panel open the Raid / Backup ticket-making form directly
+  - Tickets have an Edit button (requester only) to change region, players, clan and server link
+  - After 50 messages in a ticket the bot posts "Ah, this is a real mess." with a
+    "Jump to Information" button (repeats every 50 further messages)
+  - Ticket info message is now tracked by id (the live duration timer no longer breaks in
+    busy tickets)
   Earlier changes (all still included):
+  - Renamed Imperium -> Cruxer everywhere (old category/data file still recognised)
+  - Request limit is a 24 hour window that starts at the member's first request
+  - "Dispatched Successfully" info card after a request is created
+  - /frnd request, /see, /hitlist add profile, region auto-detect, farewell channel
   - Atomic data file with .bak backup, corrupt file moved aside
-  - Requests need an existing Roblox profile AND a joinable game; verified join
-    link stored; ticket info shows the SERVER LINK
+  - Requests need an existing Roblox profile AND a joinable game; verified join link stored
   - One panel/leaderboard copy per channel, on_ready setup runs once
   - #snipe channel for all hitlist/see alerts
   - /whois, /sync, /add, /audit, /view, /link, /unlink, /blacklist, /role,
-    /tickets-export, /bot stats, /antinuke, /overview, /member-stats
+    /tickets-export, /bot stats, /overview, /member-stats
   - Helper offline warnings (in the ticket after 5 minutes, in #logs at the end)
-  - Global leaderboard is never reset; a member's SERVER stats reset when
-    they leave that server
+  - A member's SERVER stats reset when they leave that server (global never resets)
 """
 
 import asyncio
 import copy
+import hashlib
 import io
 import json
 import math
@@ -117,6 +128,8 @@ FAREWELL_CHANNEL_NAME = "cruxer-farewell"
 
 SUPPORT_SERVER_INVITE = None
 
+PREFIXES = (".", "!")  # ".av" works; "!sync" keeps working
+
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _NEW_DATA = os.path.join(_BASE_DIR, "cruxer_data.json")
 _OLD_DATA = os.path.join(_BASE_DIR, "imperium_data.json")
@@ -126,6 +139,7 @@ DATA_FILE = (
     or (_OLD_DATA if os.path.exists(_OLD_DATA) and not os.path.exists(_NEW_DATA) else _NEW_DATA)
 )
 BACKUP_FILE = DATA_FILE + ".bak"
+GLOBAL_FILE = os.getenv("CRUXER_GLOBAL_FILE") or os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), "cruxer_global.json")
 
 LEADERBOARD_PAGE_SIZE = 10
 DURATION_UPDATE_SECONDS = 30
@@ -136,12 +150,16 @@ ANTINUKE_WINDOW_SECONDS = 600  # look back 10 minutes for recent activity
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")
 RALVORA_API_URL = os.getenv("RALVORA_API_URL")
 RALVORA_API_KEY = os.getenv("RALVORA_API_KEY")
-TRACKER_POLL_SECONDS = 20
+TRACKER_POLL_SECONDS = 10
 MAX_TRACKED_PER_GUILD = 25
 OWN = "[OWN] "
 JOIN_WARNING_SECONDS = 300      # warn if a helper is still offline this long after joining
 JOIN_CHECK_POLL_SECONDS = 30
 REQUIRE_LINK = False            # True = members must /link before they can request
+
+TICKET_MESS_THRESHOLD = 50      # "Ah, this is a real mess." after this many messages (then every +50)
+MESS_PREFIX = "**Ah, this is a real mess.**"
+BACKUP_INTERVAL_HOURS = 6       # DM the developer a data backup this often
 
 # ======================================================
 
@@ -192,7 +210,18 @@ def load_data():
     data.setdefault("panel_channels", {})
     data.setdefault("leaderboard_channels", {})
     data.setdefault("ticket_archive", {})  # permanent copy of every ticket, never cleared
+    data.setdefault("global_history", [])  # permanent, append-only list of every finished raid
+    data.setdefault("nuke_snapshots", {})  # what /anti-nuke changed, so /nuke-restore can undo it
     return data
+
+
+def _atomic_write_json(path: str, payload) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic: the file is never half-written
 
 
 def save_data():
@@ -209,8 +238,68 @@ def save_data():
     os.replace(tmp, DATA_FILE)  # atomic: the file is never half-written
 
 
+def save_global_file():
+    """Second copy of ONLY the global leaderboard totals + full raid history (never reset)."""
+    try:
+        _atomic_write_json(GLOBAL_FILE, {
+            "saved_at": int(time.time()),
+            "global": DATA["stats"]["global"],
+            "history": DATA["global_history"],
+        })
+    except OSError as exc:
+        print(f"[{BOT_NAME}] Could not write the global history file: {exc!r}")
+
+
+def _read_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+DATA_WAS_FRESH = not (os.path.exists(DATA_FILE) or os.path.exists(BACKUP_FILE))
 DATA = load_data()
 BOT_START_TIME = int(time.time())
+
+
+def merge_global_sources():
+    """Make sure the global leaderboard can only ever go UP: merge the extra global file and
+    rebuild from the permanent ticket archive. Safe to run as often as you like."""
+    changed = False
+    g = DATA["stats"]["global"]
+
+    gf = _read_json(GLOBAL_FILE) or {}
+    for uid, count in (gf.get("global") or {}).items():
+        if isinstance(count, int) and count > g.get(uid, 0):
+            g[uid] = count
+            changed = True
+
+    known = {(h.get("ts"), h.get("guild_id"), h.get("raid_number")) for h in DATA["global_history"]}
+    for h in gf.get("history") or []:
+        key = (h.get("ts"), h.get("guild_id"), h.get("raid_number"))
+        if key not in known:
+            DATA["global_history"].append(h)
+            known.add(key)
+            changed = True
+
+    tally: dict[str, int] = {}
+    for t in DATA["ticket_archive"].values():
+        if t.get("ended_at") and t.get("result"):
+            for uid in t.get("helper_order", []):
+                tally[uid] = tally.get(uid, 0) + 1
+    for uid, count in tally.items():
+        if count > g.get(uid, 0):
+            g[uid] = count
+            changed = True
+
+    DATA["global_history"].sort(key=lambda h: h.get("ts", 0))
+    if changed:
+        save_data()
+    save_global_file()
+
+
+merge_global_sources()
 
 
 def next_raid_number(guild_id: int) -> int:
@@ -238,7 +327,7 @@ def today_str() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def add_raid_credit(guild_id: int, user_ids):
+def add_raid_credit(guild_id: int, user_ids, raid_number=None, result=None, guild_name=None):
     gid = str(guild_id)
     guild_stats = DATA["stats"]["guilds"].setdefault(gid, {})
     global_stats = DATA["stats"]["global"]
@@ -256,7 +345,18 @@ def add_raid_credit(guild_id: int, user_ids):
         global_stats[uid] = global_stats.get(uid, 0) + 1
         daily_stats[uid] = daily_stats.get(uid, 0) + 1
 
+    # Permanent history entry (never trimmed, never touched by /deauthorize).
+    DATA["global_history"].append({
+        "ts": int(time.time()),
+        "guild_id": guild_id,
+        "guild_name": guild_name,
+        "raid_number": raid_number,
+        "result": result,
+        "helpers": [str(u) for u in user_ids],
+    })
+
     save_data()
+    save_global_file()
 
 
 def get_raid_count(guild_id: int, user_id: int, scope: str) -> int:
@@ -439,19 +539,27 @@ async def delete_previous(channel: discord.TextChannel, msg_key: str, chan_key: 
         pass
 
 
-# ---- duplicate panel / leaderboard cleanup ----
+# ---- finding / removing old panels and leaderboards (current AND legacy embed ones) ----
 
 _refresh_locks: dict[str, asyncio.Lock] = {}
 
+PURGE_KEYS = {
+    "panel": ("panel_messages", "panel_channels"),
+    "leaderboard": ("leaderboard_messages", "leaderboard_channels"),
+}
+PURGE_MARKERS = {"panel": "tsb:panel:request", "leaderboard": "lb:scope"}
+PANEL_HINTS = (
+    "choose raid or backup", "backup panel", "rescue ticket", "request for raids",
+    "what is the benefit of using this", "create rescue ticket",
+)
 
-def _collect_custom_ids(components) -> set:
-    """Walk a message's (possibly nested Components V2) components and return every custom_id."""
-    found, stack = set(), list(components or [])
+
+def _walk_components(components):
+    """Yield every component of a message, including ones nested inside Components V2 layouts."""
+    stack = list(components or [])
     while stack:
         c = stack.pop()
-        cid = getattr(c, "custom_id", None)
-        if cid:
-            found.add(cid)
+        yield c
         for attr in ("children", "components"):
             kids = getattr(c, attr, None)
             if kids:
@@ -462,17 +570,78 @@ def _collect_custom_ids(components) -> set:
         accessory = getattr(c, "accessory", None)
         if accessory:
             stack.append(accessory)
+
+
+def _component_ids(components) -> set:
+    found = set()
+    for c in _walk_components(components):
+        cid = getattr(c, "custom_id", None)
+        if cid:
+            found.add(cid)
     return found
 
 
-async def purge_old_messages(channel: discord.TextChannel, marker: str, msg_key: str, chan_key: str):
-    """Delete the stored message AND every other bot message in this channel that carries the marker component."""
+def message_blob(msg: discord.Message) -> str:
+    """All readable text of a message (content, embeds, V2 text displays, select labels), lowercased."""
+    parts = [msg.content or ""]
+    for e in msg.embeds:
+        parts += [e.title or "", e.description or ""]
+        for f in e.fields:
+            parts += [f.name or "", f.value or ""]
+        if e.footer and e.footer.text:
+            parts.append(e.footer.text)
+    for c in _walk_components(msg.components):
+        content = getattr(c, "content", None)
+        if isinstance(content, str):
+            parts.append(content)
+        placeholder = getattr(c, "placeholder", None)
+        if isinstance(placeholder, str):
+            parts.append(placeholder)
+        for opt in getattr(c, "options", None) or []:
+            parts += [str(getattr(opt, "label", "")), str(getattr(opt, "value", ""))]
+    return "\n".join(p for p in parts if p).lower()
+
+
+def msg_is_functional(msg: discord.Message, kind: str) -> bool:
+    """A working, current-version panel/leaderboard (Components V2 layout carrying our marker id)."""
+    if PURGE_MARKERS[kind] not in _component_ids(msg.components):
+        return False
+    return bool(getattr(msg.flags, "components_v2", False))
+
+
+def msg_looks_like(msg: discord.Message, kind: str) -> bool:
+    """Current OR legacy (old embed style) panel / leaderboard."""
+    ids = _component_ids(msg.components)
+    blob = message_blob(msg)
+    if kind == "panel":
+        if any(i.startswith("tsb:panel") for i in ids):
+            return True
+        return any(h in blob for h in PANEL_HINTS)
+    if any(i.startswith("lb:") for i in ids):
+        return True
+    return "leaderboard" in blob
+
+
+def _is_dedicated(channel: discord.TextChannel, kind: str) -> bool:
+    if kind == "panel":
+        return channel.id == BATTLE_PANEL_CHANNEL_ID or channel.name.lower() == BATTLE_PANEL_CHANNEL_NAME
+    return channel.id == LEADERBOARD_CHANNEL_ID or channel.name.lower() == LEADERBOARD_CHANNEL_NAME
+
+
+async def purge_old_messages(channel: discord.TextChannel, kind: str):
+    """Delete the stored message AND every old/legacy panel (or leaderboard) the bot left in this channel.
+    In the bot's own dedicated channel every old bot message is removed."""
+    msg_key, chan_key = PURGE_KEYS[kind]
     await delete_previous(channel, msg_key, chan_key)
+    wipe_all = _is_dedicated(channel, kind)
     try:
         async for msg in channel.history(limit=200):
-            if msg.author.id == bot.user.id and marker in _collect_custom_ids(msg.components):
+            if msg.author.id != bot.user.id:
+                continue
+            if wipe_all or msg_looks_like(msg, kind):
                 try:
                     await msg.delete()
+                    leaderboard_state.pop(msg.id, None)
                 except discord.HTTPException:
                     pass
     except (discord.Forbidden, discord.HTTPException):
@@ -503,6 +672,17 @@ class BlacklistGate:
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await blacklist_gate(interaction)
+
+
+# background tasks must be referenced or Python may garbage-collect them mid-run
+_bg_tasks: set = set()
+
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 # ======================================================
@@ -789,6 +969,32 @@ class ConfigModal(discord.ui.Modal, title="Configuration"):
             )
 
 
+async def start_request_flow(interaction: discord.Interaction, request_type: str):
+    """The ticket-making process: rate limit -> joins/in-game check -> request form.
+    Used by the panel dropdown, /raid panel and /backup panel. Must answer the interaction itself."""
+    if interaction.guild is None:
+        return await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+    if find_category(interaction.guild) is None:
+        return await interaction.response.send_message(
+            f"{BOT_NAME} is not authorized in this server yet. Ask the developer to run /authorize.", ephemeral=True
+        )
+
+    allowed, count, resets = rate_limit_status(interaction.guild.id, interaction.user.id)
+    if not allowed:
+        return await interaction.response.send_message(rate_limit_text(count, resets), ephemeral=True)
+
+    state, prefilled_link = "skip", None
+    try:
+        state, prefilled_link = await asyncio.wait_for(join_check(interaction.user.id), timeout=2.2)
+    except Exception:
+        state, prefilled_link = "skip", None
+
+    if state == "blocked":
+        await interaction.response.send_message(view=JoinCheckView(request_type, interaction.user.id), ephemeral=True)
+    else:
+        await interaction.response.send_modal(RequestModal(request_type, interaction.user.id, prefilled_link))
+
+
 class PanelView(BlacklistGate, discord.ui.LayoutView):
     def __init__(self):
         super().__init__(timeout=None)
@@ -809,24 +1015,7 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
 
         async def select_callback(interaction: discord.Interaction):
             request_type = request_select.values[0]
-            allowed, count, resets = rate_limit_status(interaction.guild.id, interaction.user.id)
-
-            if not allowed:
-                await interaction.response.send_message(rate_limit_text(count, resets), ephemeral=True)
-            else:
-                state, prefilled_link = "skip", None
-                try:
-                    state, prefilled_link = await asyncio.wait_for(join_check(interaction.user.id), timeout=2.2)
-                except Exception:
-                    state, prefilled_link = "skip", None
-                if state == "blocked":
-                    await interaction.response.send_message(
-                        view=JoinCheckView(request_type, interaction.user.id), ephemeral=True
-                    )
-                else:
-                    await interaction.response.send_modal(
-                        RequestModal(request_type, interaction.user.id, prefilled_link)
-                    )
+            await start_request_flow(interaction, request_type)
 
             # Put the select back to "Choose Raid or Backup" so the same option can be picked again.
             try:
@@ -886,8 +1075,8 @@ async def refresh_panel(channel: discord.TextChannel):
     gid = str(channel.guild.id)
     lock = _refresh_locks.setdefault(f"panel:{gid}", asyncio.Lock())
     async with lock:
-        # Removes the stored panel AND any other leftover panel in this channel.
-        await purge_old_messages(channel, "tsb:panel:request", "panel_messages", "panel_channels")
+        # Removes the stored panel AND every old / legacy (embed) panel left in this channel.
+        await purge_old_messages(channel, "panel")
 
         new_msg = await channel.send(view=PanelView())
         DATA["panel_messages"][gid] = new_msg.id
@@ -1102,6 +1291,9 @@ class RequestModal(discord.ui.Modal):
             "ended_by": None,
             "deleted_by": None,
             "results_url": None,
+            "info_message_id": None,
+            "message_count": 0,
+            "edit_btn": True,
         }
         save_ticket(channel.id, ticket)
 
@@ -1115,6 +1307,8 @@ class RequestModal(discord.ui.Modal):
             view=TicketView(channel.id, profile_url),
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
+        ticket["info_message_id"] = ticket_msg.id
+        save_ticket(channel.id, ticket)
 
         await log_ticket_created(guild, ticket, ticket_msg.jump_url, profile_url)
 
@@ -1149,8 +1343,146 @@ def build_ticket_embed(ticket: dict) -> discord.Embed:
         helpers_text = "No helpers yet."
     embed.add_field(name="HELPERS", value=helpers_text, inline=False)
 
-    embed.set_footer(text=BOT_NAME)
+    footer = BOT_NAME + (" - edited by the requester" if ticket.get("edited_at") else "")
+    embed.set_footer(text=footer)
     return embed
+
+
+# ---- the ticket's information message (tracked by id so it can always be found) ----
+
+async def locate_info_message_id(channel: discord.TextChannel, ticket: dict):
+    mid = ticket.get("info_message_id")
+    if mid:
+        return mid
+    try:
+        async for msg in channel.history(limit=15, oldest_first=True):
+            if msg.author.id == bot.user.id and msg.embeds:
+                ticket["info_message_id"] = msg.id
+                save_ticket(channel.id, ticket)
+                return msg.id
+    except discord.HTTPException:
+        pass
+    return None
+
+
+async def refresh_ticket_message(channel: discord.TextChannel, ticket: dict, view=None) -> bool:
+    """Re-render the ticket information embed (duration, helpers, edits) on its own message."""
+    mid = await locate_info_message_id(channel, ticket)
+    if not mid:
+        return False
+    kwargs = {"embed": build_ticket_embed(ticket)}
+    if view is not None:
+        kwargs["view"] = view
+    try:
+        await channel.get_partial_message(mid).edit(**kwargs)
+        return True
+    except (discord.NotFound, discord.HTTPException):
+        return False
+
+
+# ======================================================
+# EDIT REQUEST MODAL (requester changes the ticket information)
+# ======================================================
+
+class EditRequestModal(discord.ui.Modal, title="Edit Request"):
+    def __init__(self, channel_id: int, ticket: dict):
+        super().__init__()
+        self.channel_id = channel_id
+
+        region_default = ticket["region"] if ticket.get("region") not in (None, "Unknown") else None
+        self.region = discord.ui.TextInput(
+            label="Server region (empty = auto-detect)",
+            default=region_default[:30] if region_default else None,
+            required=False,
+            max_length=30,
+        )
+        self.reported = discord.ui.TextInput(
+            label="Reported players / details",
+            style=discord.TextStyle.paragraph,
+            default=(ticket.get("reported_players") or "")[:500] or None,
+            max_length=500,
+        )
+        self.add_item(self.region)
+        self.add_item(self.reported)
+
+        self.clan = None
+        if ticket["type"] == "Raid":
+            self.clan = discord.ui.TextInput(
+                label="Enemy guild / clan",
+                default=(ticket.get("clan") or "")[:60] or None,
+                required=False,
+                max_length=60,
+            )
+            self.add_item(self.clan)
+
+        self.server_link = discord.ui.TextInput(
+            label="Server link (change it only if you moved)",
+            default=(ticket.get("server_link") or "")[:300] or None,
+            max_length=300,
+        )
+        self.add_item(self.server_link)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ticket = get_ticket(self.channel_id)
+        if not ticket or ticket["status"] != "open":
+            return await interaction.response.send_message("This ticket is not open anymore.", ephemeral=True)
+        if interaction.user.id not in (ticket["requester_id"], DEVELOPER_ID):
+            return await interaction.response.send_message("Only the requester can edit this.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        session = interaction.client.session
+        changes = []
+
+        # server link: if it changed it must be a real roblox.com link; with a cookie it is re-verified live
+        link = self.server_link.value.strip()
+        if link != ticket["server_link"]:
+            if not is_roblox_url(link):
+                return await interaction.followup.send("Server link must be a valid roblox.com link.", ephemeral=True)
+            if ROBLOX_COOKIE:
+                ok, error, verified = await verify_requester(session, ticket["roblox_id"], link)
+                if not ok:
+                    return await interaction.followup.send(error, ephemeral=True)
+                link = verified
+            if link != ticket["server_link"]:
+                ticket["server_link"] = link
+                changes.append("Server link")
+
+        # region: empty = detect from the (possibly new) server
+        region = self.region.value.strip()
+        if not region:
+            place_id, job_id = parse_roblox_link(ticket["server_link"])
+            region = await detect_server_region(session, place_id, job_id) or ticket.get("region") or "Unknown"
+        if region != ticket.get("region"):
+            ticket["region"] = region
+            changes.append("Region")
+
+        reported = self.reported.value.strip()
+        if reported != ticket.get("reported_players"):
+            ticket["reported_players"] = reported
+            changes.append("Reported players")
+
+        if self.clan is not None:
+            clan = self.clan.value.strip() or None
+            if clan != ticket.get("clan"):
+                ticket["clan"] = clan
+                changes.append("Enemy guild")
+
+        if not changes:
+            return await interaction.followup.send("Nothing was changed.", ephemeral=True)
+
+        ticket["edited_at"] = int(time.time())
+        ticket.setdefault("edit_history", []).append({"ts": ticket["edited_at"], "by": interaction.user.id, "fields": changes})
+        save_ticket(self.channel_id, ticket)
+
+        await refresh_ticket_message(interaction.channel, ticket)
+        try:
+            await interaction.channel.send(
+                f"<@{interaction.user.id}> updated the request: **{', '.join(changes)}**.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send("Request updated.", ephemeral=True)
 
 
 # ======================================================
@@ -1195,13 +1527,7 @@ class JoinRobloxModal(discord.ui.Modal, title="Join Raid"):
         except discord.Forbidden:
             pass
 
-        try:
-            async for msg in channel.history(limit=20):
-                if msg.author == interaction.client.user and msg.embeds:
-                    await msg.edit(embed=build_ticket_embed(ticket))
-                    break
-        except discord.HTTPException:
-            pass
+        await refresh_ticket_message(channel, ticket)
 
         # Only a redirect to the member's Roblox profile - no username/bio text.
         profile_url = roblox_profile_url(roblox_id)
@@ -1217,7 +1543,7 @@ class JoinRobloxModal(discord.ui.Modal, title="Join Raid"):
 
 
 # ======================================================
-# TICKET VIEW (Join Raid / End)
+# TICKET VIEW (Join Raid / End / Edit)
 # ======================================================
 
 class TicketView(BlacklistGate, discord.ui.View):
@@ -1232,6 +1558,10 @@ class TicketView(BlacklistGate, discord.ui.View):
         end_btn = discord.ui.Button(label="End", style=discord.ButtonStyle.danger, custom_id=f"tsb:end:{channel_id}")
         end_btn.callback = self.end_callback
         self.add_item(end_btn)
+
+        edit_btn = discord.ui.Button(label="Edit", style=discord.ButtonStyle.secondary, custom_id=f"tsb:edit:{channel_id}")
+        edit_btn.callback = self.edit_callback
+        self.add_item(edit_btn)
 
         if profile_url:
             self.add_item(discord.ui.Button(label="Open Profile", style=discord.ButtonStyle.link, url=profile_url))
@@ -1256,6 +1586,14 @@ class TicketView(BlacklistGate, discord.ui.View):
             return await interaction.response.send_message("Only the requester or staff can end this.", ephemeral=True)
 
         await interaction.response.send_message("Choose the raid result.", view=RaidResultView(self.channel_id))
+
+    async def edit_callback(self, interaction: discord.Interaction):
+        ticket = get_ticket(self.channel_id)
+        if not ticket or ticket["status"] != "open":
+            return await interaction.response.send_message("This ticket is not open anymore.", ephemeral=True)
+        if interaction.user.id not in (ticket["requester_id"], DEVELOPER_ID):
+            return await interaction.response.send_message("Only the person who made this request can edit it.", ephemeral=True)
+        await interaction.response.send_modal(EditRequestModal(self.channel_id, ticket))
 
 
 # ======================================================
@@ -1389,7 +1727,10 @@ async def finalize_raid(bot_client: commands.Bot, guild: discord.Guild, channel:
 
     helper_ids = [int(uid) for uid in ticket["helper_order"]]
     if helper_ids:
-        add_raid_credit(guild.id, helper_ids)
+        add_raid_credit(
+            guild.id, helper_ids,
+            raid_number=ticket["raid_number"], result=ticket["result"], guild_name=guild.name,
+        )
 
     streak = update_win_streak(guild.id, ticket["result"])
     duration = format_duration(ticket["ended_at"] - ticket["started_at"])
@@ -1599,12 +1940,16 @@ class ReopenTicketView(discord.ui.View):
 
         ticket["status"] = "open"
         ticket["deleted_by"] = None
-        save_ticket(new_channel.id, ticket)
+        ticket["message_count"] = 0
+        ticket["edit_btn"] = True
         DATA["tickets"].pop(str(self.channel_id), None)
-        save_data()
+        save_ticket(new_channel.id, ticket)
 
         profile_url = roblox_profile_url(ticket["roblox_id"])
-        await new_channel.send(embed=build_ticket_embed(ticket), view=TicketView(new_channel.id, profile_url))
+        info_msg = await new_channel.send(embed=build_ticket_embed(ticket), view=TicketView(new_channel.id, profile_url))
+        ticket["info_message_id"] = info_msg.id
+        save_ticket(new_channel.id, ticket)
+
         await new_channel.send(
             "This ticket was re-opened by the developer. You can delete it below if needed.",
             view=DeleteTicketView(new_channel.id),
@@ -1807,11 +2152,16 @@ class LeaderboardView(BlacklistGate, discord.ui.LayoutView):
         last_btn = discord.ui.Button(label="⏩", style=discord.ButtonStyle.secondary, custom_id="lb:last")
         last_btn.callback = self.last_callback
 
+        if scope == "global":
+            scope_line = "**Scope:** *every server* - permanent history, never resets"
+        else:
+            scope_line = f"**Server:** *{guild_name}*'s server"
+
         container = discord.ui.Container(
             discord.ui.ActionRow(scope_select),
             discord.ui.TextDisplay(
                 "Leaderboard for the number of times you helped.\n\n"
-                f"**Server:** *{guild_name}*'s server"
+                f"{scope_line}"
             ),
             discord.ui.Separator(),
             discord.ui.Section(discord.ui.TextDisplay("## 📊 Your Current Stats"), accessory=my_rank_btn),
@@ -1915,7 +2265,7 @@ async def refresh_leaderboard(channel: discord.TextChannel):
     lock = _refresh_locks.setdefault(f"lb:{gid}", asyncio.Lock())
     async with lock:
         # Removes the stored leaderboard AND any other leftover leaderboard in this channel.
-        await purge_old_messages(channel, "lb:scope", "leaderboard_messages", "leaderboard_channels")
+        await purge_old_messages(channel, "leaderboard")
 
         view = await make_leaderboard_view(bot, channel.guild, "global", 0, None)
         new_msg = await channel.send(view=view)
@@ -1944,8 +2294,8 @@ class CruxerBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True  # needed for /antinuke and member names
-        super().__init__(command_prefix="!", intents=intents, tree_cls=CruxerTree)
+        intents.members = True  # needed for /anti-nuke and member names
+        super().__init__(command_prefix=commands.when_mentioned_or(*PREFIXES), intents=intents, tree_cls=CruxerTree)
         self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
@@ -1970,6 +2320,7 @@ class CruxerBot(commands.Bot):
         duration_updater.start()
         tracker_loop.start()
         join_watch_loop.start()
+        backup_loop.start()
 
     async def close(self):
         if self.session:
@@ -1978,6 +2329,22 @@ class CruxerBot(commands.Bot):
 
 
 bot = CruxerBot()
+
+
+@bot.check
+async def prefix_blacklist_check(ctx: commands.Context) -> bool:
+    """Blacklisted members cannot use prefix commands either (silent)."""
+    if ctx.author.id == DEVELOPER_ID:
+        return True
+    return str(ctx.author.id) not in DATA["blacklist"]
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    # ".something" in normal chat is not a command - never spam the console or the channel.
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return
+    print(f"[{BOT_NAME}] Prefix command error in {getattr(ctx.command, 'name', '?')}: {error!r}")
 
 
 @tasks.loop(seconds=DURATION_UPDATE_SECONDS)
@@ -1989,21 +2356,8 @@ async def duration_updater():
         channel = bot.get_channel(int(channel_id_str))
         if channel is None:
             continue
-
-        elapsed = box(format_duration(now - ticket["started_at"]))
-        try:
-            async for msg in channel.history(limit=20):
-                if msg.author != bot.user or not msg.embeds:
-                    continue
-                embed = msg.embeds[0]
-                for i, field in enumerate(embed.fields):
-                    if field.name == "DURATION":
-                        embed.set_field_at(i, name="DURATION", value=elapsed, inline=False)
-                        await msg.edit(embed=embed)
-                        break
-                break
-        except (discord.HTTPException, discord.NotFound):
-            continue
+        # Edits the tracked info message directly, so it keeps working in busy tickets (50+ messages).
+        await refresh_ticket_message(channel, ticket)
 
 
 @duration_updater.before_loop
@@ -2012,7 +2366,58 @@ async def before_duration_updater():
 
 
 # ======================================================
-# /setup_panel, /leaderboard, /say, /ping
+# BUSY TICKET NOTICE  ("Ah, this is a real mess.")
+# ======================================================
+
+@bot.listen("on_message")
+async def ticket_busy_watcher(message: discord.Message):
+    if message.guild is None:
+        return
+    if message.author.id == bot.user.id and (message.content or "").startswith(MESS_PREFIX):
+        return  # never count our own notice
+
+    ticket = get_ticket(message.channel.id)
+    if not ticket or ticket["status"] == "deleted":
+        return
+
+    ticket["message_count"] = ticket.get("message_count", 0) + 1
+    n = ticket["message_count"]
+
+    if n > TICKET_MESS_THRESHOLD and (n - 1) % TICKET_MESS_THRESHOLD == 0:
+        info_id = await locate_info_message_id(message.channel, ticket)
+        view = None
+        if info_id:
+            url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{info_id}"
+            view = discord.ui.View(timeout=None)
+            view.add_item(discord.ui.Button(label="Jump to Information", style=discord.ButtonStyle.link, url=url))
+        try:
+            await message.channel.send(
+                f"{MESS_PREFIX}\n-# {n} messages in this ticket now. Jump back to the request information below.",
+                view=view,
+            )
+        except discord.HTTPException:
+            pass
+        save_ticket(message.channel.id, ticket)
+    elif n % 10 == 0:
+        save_ticket(message.channel.id, ticket)
+
+
+async def upgrade_open_tickets():
+    """Tickets opened before this update get the new Edit button on their information message (once)."""
+    for cid, ticket in list(DATA["tickets"].items()):
+        if ticket["status"] != "open" or ticket.get("edit_btn"):
+            continue
+        channel = bot.get_channel(int(cid))
+        if channel is None:
+            continue
+        profile_url = roblox_profile_url(ticket.get("roblox_id"))
+        if await refresh_ticket_message(channel, ticket, view=TicketView(int(cid), profile_url)):
+            ticket["edit_btn"] = True
+            save_ticket(int(cid), ticket)
+
+
+# ======================================================
+# /setup_panel, /leaderboard, /say, /ping, /nuke
 # ======================================================
 
 @bot.tree.command(name="setup_panel", description="Post/refresh the raid request panel in this channel")
@@ -2052,6 +2457,210 @@ async def say_command(interaction: discord.Interaction, message: str):
 async def ping_command(interaction: discord.Interaction):
     latency_ms = round(bot.latency * 1000)
     await interaction.response.send_message(f"{BOT_NAME} is online.\nLatency: {latency_ms} ms")
+
+
+@bot.tree.command(name="nuke", description="Go on. Press it.")
+async def nuke_command(interaction: discord.Interaction):
+    await interaction.response.send_message("This guy thought he's him lol.")
+
+
+# ======================================================
+# /raid panel  and  /backup panel  (open the ticket-making process directly)
+# ======================================================
+
+raid_group = app_commands.Group(name="raid", description="Raid requests", guild_only=True)
+backup_group = app_commands.Group(name="backup", description="Backup requests", guild_only=True)
+
+
+@raid_group.command(name="panel", description="Open the Raid ticket-making form")
+async def raid_panel_command(interaction: discord.Interaction):
+    await start_request_flow(interaction, "Raid")
+
+
+@backup_group.command(name="panel", description="Open the Backup ticket-making form")
+async def backup_panel_command(interaction: discord.Interaction):
+    await start_request_flow(interaction, "Backup")
+
+
+bot.tree.add_command(raid_group)
+bot.tree.add_command(backup_group)
+
+
+# ======================================================
+# .av  (prefix command: avatar + profile of a user)
+# ======================================================
+
+async def resolve_prefix_target(ctx: commands.Context, text: str | None):
+    """A mention, an ID, a name, or - with no text - the author of the replied-to message, or yourself."""
+    if not text:
+        ref = ctx.message.reference
+        if ref and isinstance(ref.resolved, discord.Message):
+            author = ref.resolved.author
+            return (ctx.guild.get_member(author.id) if ctx.guild else None) or author
+        return ctx.author
+
+    text = text.strip()
+    for converter in (commands.MemberConverter, commands.UserConverter):
+        try:
+            return await converter().convert(ctx, text)
+        except commands.CommandError:
+            continue
+    if text.isdigit():
+        try:
+            return await bot.fetch_user(int(text))
+        except discord.HTTPException:
+            pass
+    return None
+
+
+@bot.command(name="av", aliases=["avatar", "pfp"])
+async def av_command(ctx: commands.Context, *, target: str = None):
+    """.av [user]  - avatar (all formats), banner and profile of a user."""
+    user = await resolve_prefix_target(ctx, target)
+    if user is None:
+        return await ctx.reply("I could not find that user. Mention them or give their ID.", mention_author=False)
+
+    try:
+        full = await bot.fetch_user(user.id)  # needed for the banner / accent colour
+    except discord.HTTPException:
+        full = user
+    member = user if isinstance(user, discord.Member) else (ctx.guild.get_member(user.id) if ctx.guild else None)
+
+    shown = (member or full).display_avatar
+    formats = ["png", "jpg", "webp"] + (["gif"] if shown.is_animated() else [])
+    links = []
+    for fmt in formats:
+        try:
+            links.append(f"[{fmt.upper()}]({shown.replace(size=1024, format=fmt).url})")
+        except (ValueError, TypeError):
+            continue
+
+    color = full.accent_colour or discord.Colour(EMBED_COLOR)
+    name = (member or full).display_name
+
+    av_embed = discord.Embed(title=f"Avatar - {name}", color=color)
+    av_embed.set_image(url=shown.replace(size=1024).url)
+    desc = " | ".join(links)
+    if member and member.guild_avatar and full.avatar and member.guild_avatar.key != full.avatar.key:
+        desc += f"\n**Global avatar:** [Open]({full.avatar.replace(size=1024).url})"
+        av_embed.set_thumbnail(url=full.avatar.replace(size=256).url)
+    av_embed.description = desc
+
+    pr = discord.Embed(title=f"Profile - {name}", color=color)
+    created = int(full.created_at.timestamp())
+    pr.add_field(
+        name="Account",
+        value=(
+            f"**Username:** `{full.name}`\n**ID:** `{full.id}`\n**Mention:** <@{full.id}>\n"
+            f"**Bot:** {'Yes' if full.bot else 'No'}\n"
+            f"**Created:** <t:{created}:F> (<t:{created}:R>)"
+        ),
+        inline=False,
+    )
+    badges = [f.name.replace("_", " ").title() for f in full.public_flags.all()]
+    if badges:
+        pr.add_field(name="Badges", value=", ".join(badges), inline=False)
+    if member:
+        joined = int(member.joined_at.timestamp()) if member.joined_at else None
+        pr.add_field(
+            name="In This Server",
+            value=(
+                f"**Nickname:** {member.nick or 'None'}\n"
+                f"**Joined:** {f'<t:{joined}:R>' if joined else 'Unknown'}\n"
+                f"**Top role:** {member.top_role.mention}"
+            ),
+            inline=False,
+        )
+    link = DATA["links"].get(str(full.id))
+    assists = DATA["stats"]["global"].get(str(full.id), 0)
+    if link or assists:
+        roblox_text = f"[{link['roblox_username']}]({roblox_profile_url(link['roblox_id'])})" if link else "Not linked"
+        pr.add_field(name=BOT_NAME, value=f"**Roblox:** {roblox_text}\n**Global assists:** {assists:,}", inline=False)
+    if full.banner:
+        pr.set_image(url=full.banner.replace(size=1024).url)
+    pr.set_footer(text=f"Requested by {ctx.author.display_name}")
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Open Avatar", style=discord.ButtonStyle.link, url=shown.replace(size=1024).url))
+    if full.banner:
+        view.add_item(discord.ui.Button(label="Open Banner", style=discord.ButtonStyle.link, url=full.banner.replace(size=1024).url))
+
+    await ctx.reply(embeds=[av_embed, pr], view=view, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ======================================================
+# /purge  (keep only the newest working panel / leaderboard)
+# ======================================================
+
+@bot.tree.command(name="purge", description="Keep only the latest panel and delete all the older ones")
+@app_commands.describe(item="What to clean up (default: Backup Panel)", server_wide="Also clean the other channels of this server")
+@app_commands.choices(item=[
+    app_commands.Choice(name="Backup Panel", value="panel"),
+    app_commands.Choice(name="Leaderboard", value="leaderboard"),
+])
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def purge_command(interaction: discord.Interaction, item: app_commands.Choice[str] = None, server_wide: bool = False):
+    if not await require_admin(interaction):
+        return
+    kind = item.value if item else "panel"
+    guild = interaction.guild
+
+    if server_wide:
+        channels = [c for c in guild.text_channels if c.permissions_for(guild.me).read_message_history]
+        depth = 150
+    else:
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("Use this in a normal text channel.", ephemeral=True)
+        channels = [interaction.channel]
+        depth = 500
+
+    await interaction.response.defer(ephemeral=True)
+
+    candidates = []
+    for ch in channels:
+        try:
+            async for msg in ch.history(limit=depth):
+                if msg.author.id == bot.user.id and msg_looks_like(msg, kind):
+                    candidates.append(msg)
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    functional = [m for m in candidates if msg_is_functional(m, kind)]
+    keep = max(functional, key=lambda m: m.id) if functional else None
+
+    removed = 0
+    for m in candidates:
+        if keep is not None and m.id == keep.id:
+            continue
+        try:
+            await m.delete()
+            leaderboard_state.pop(m.id, None)
+            removed += 1
+        except discord.HTTPException:
+            continue
+
+    msg_key, chan_key = PURGE_KEYS[kind]
+    label = "panel" if kind == "panel" else "leaderboard"
+
+    if keep is None:
+        # nothing working was left, so post a fresh one here
+        if isinstance(interaction.channel, discord.TextChannel):
+            if kind == "panel":
+                await refresh_panel(interaction.channel)
+            else:
+                await refresh_leaderboard(interaction.channel)
+        return await interaction.followup.send(
+            f"No working {label} was found, so I removed {removed} old/legacy one(s) and posted a fresh one here.",
+            ephemeral=True,
+        )
+
+    DATA[msg_key][str(guild.id)] = keep.id
+    DATA[chan_key][str(guild.id)] = keep.channel.id
+    save_data()
+    await interaction.followup.send(
+        f"Kept the latest {label}: {keep.jump_url}\nRemoved {removed} older one(s).", ephemeral=True
+    )
 
 
 # ======================================================
@@ -2116,6 +2725,13 @@ async def deauthorize_command(interaction: discord.Interaction):
             pass
 
     gid = str(guild.id)
+
+    # Raid numbers restart after a re-authorize, so keep this server's archived tickets under a unique key
+    # (otherwise new "#1" tickets would overwrite the old "#1" in the permanent archive).
+    stamp = int(time.time())
+    for key in [k for k, v in DATA["ticket_archive"].items() if v.get("guild_id") == guild.id and ":pre" not in k]:
+        DATA["ticket_archive"][f"{key}:pre{stamp}"] = DATA["ticket_archive"].pop(key)
+
     DATA["authorized_guilds"] = [g for g in DATA["authorized_guilds"] if g != guild.id]
     DATA["panel_messages"].pop(gid, None)
     DATA["leaderboard_messages"].pop(gid, None)
@@ -2124,10 +2740,12 @@ async def deauthorize_command(interaction: discord.Interaction):
     DATA["stats"]["daily"].pop(gid, None)
     DATA["request_limits"].pop(gid, None)
     DATA["win_streaks"].pop(gid, None)
+    DATA["nuke_snapshots"].pop(gid, None)
     DATA["trackers"] = {k: t for k, t in DATA["trackers"].items() if t.get("guild_id") != guild.id}
-    # NOTE: DATA["stats"]["global"] and DATA["ticket_archive"] are intentionally never touched here.
+    # NOTE: DATA["stats"]["global"], DATA["global_history"] and DATA["ticket_archive"] are intentionally never wiped here.
     DATA["tickets"] = {cid: t for cid, t in DATA["tickets"].items() if t.get("guild_id") != guild.id}
     save_data()
+    save_global_file()
 
     try:
         await interaction.followup.send(f"{BOT_NAME} has been removed from this server. Leaving now.", ephemeral=True)
@@ -2195,10 +2813,23 @@ async def overview_command(interaction: discord.Interaction):
 
 
 # ======================================================
-# /bot stats  (owner only, public message)
+# /bot stats  (owner only, public message) - view ANY server + remove the bot from any server
 # ======================================================
 
 bot_group = app_commands.Group(name="bot", description="[OWN] Cruxer bot management", guild_only=True)
+
+REQUIRED_PERMS = [
+    ("manage_channels", "Manage Channels"),
+    ("manage_roles", "Manage Roles"),
+    ("manage_webhooks", "Manage Webhooks"),
+    ("manage_guild", "Manage Server"),
+    ("kick_members", "Kick Members"),
+    ("view_audit_log", "View Audit Log"),
+    ("embed_links", "Embed Links"),
+    ("attach_files", "Attach Files"),
+    ("read_message_history", "Read Message History"),
+    ("create_instant_invite", "Create Invite"),
+]
 
 
 def _truncate_field(lines: list[str], limit: int = 1000) -> str:
@@ -2221,24 +2852,59 @@ def build_bot_stats_embed(guild: discord.Guild) -> discord.Embed:
     total_raids = DATA["raid_counters"].get(gid, 0)
     server_assists = sum(DATA["stats"]["guilds"].get(gid, {}).values())
     uptime = format_duration(int(time.time()) - BOT_START_TIME)
+    perms = guild.me.guild_permissions
 
-    embed = discord.Embed(title=f"{BOT_NAME} - Bot Stats", color=EMBED_COLOR)
-    embed.add_field(name="Authorized in this server", value="Yes" if authorized else "No", inline=True)
-    embed.add_field(name="Administrator", value="Yes" if guild.me.guild_permissions.administrator else "No", inline=True)
+    embed = discord.Embed(title=f"{BOT_NAME} - Bot Stats", description=f"Viewing **{discord.utils.escape_markdown(guild.name)}** (`{guild.id}`)", color=EMBED_COLOR)
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="Authorized", value="Yes" if authorized else "No", inline=True)
+    embed.add_field(name="Administrator", value="Yes" if perms.administrator else "No", inline=True)
     embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)} ms", inline=True)
+
+    missing = [label for attr, label in REQUIRED_PERMS if not (perms.administrator or getattr(perms, attr, False))]
+    embed.add_field(
+        name="Bot Permissions",
+        value="All required permissions are granted." if not missing else "**Missing:** " + ", ".join(missing),
+        inline=False,
+    )
 
     role_lines = [role.mention for role in reversed(guild.me.roles) if not role.is_default()]
     embed.add_field(name=f"Bot Roles ({len(role_lines)})", value=_truncate_field(role_lines), inline=False)
+
+    created = int(guild.created_at.timestamp())
+    bot_joined = int(guild.me.joined_at.timestamp()) if guild.me.joined_at else None
+    embed.add_field(
+        name="Server Info",
+        value=(
+            f"Owner: <@{guild.owner_id}> (`{guild.owner_id}`)\n"
+            f"Created: <t:{created}:R>\n"
+            f"Bot joined: {f'<t:{bot_joined}:R>' if bot_joined else 'Unknown'}\n"
+            f"Boost level: `{guild.premium_tier}`"
+        ),
+        inline=False,
+    )
 
     embed.add_field(
         name=f"Server Stats - {guild.name}",
         value=(
             f"Members: `{guild.member_count or 0:,}`\n"
             f"Text channels: `{len(guild.text_channels)}`\n"
+            f"Voice channels: `{len(guild.voice_channels)}`\n"
+            f"Categories: `{len(guild.categories)}`\n"
             f"Roles: `{len(guild.roles)}`\n"
             f"Open tickets: `{open_tickets}`\n"
             f"Raids logged: `{total_raids}`\n"
             f"Total assists: `{server_assists}`"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Global (all servers)",
+        value=(
+            f"Leaderboard members: `{len(DATA['stats']['global']):,}`\n"
+            f"Total assists ever: `{sum(DATA['stats']['global'].values()):,}`\n"
+            f"Raids in history: `{len(DATA['global_history']):,}`"
         ),
         inline=False,
     )
@@ -2283,31 +2949,80 @@ class ConfirmLeaveView(discord.ui.View):
 
 
 class BotStatsView(discord.ui.View):
-    def __init__(self, current_guild_id: int):
-        super().__init__(timeout=600)
-        self.current_guild_id = current_guild_id
+    PAGE_SIZE = 25
 
-        remove_here = discord.ui.Button(label="Remove Bot From This Server", style=discord.ButtonStyle.danger)
+    def __init__(self, current_guild_id: int, page: int = 0):
+        super().__init__(timeout=900)
+        self.current_guild_id = current_guild_id
+        self.page = page
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        guilds = sorted(bot.guilds, key=lambda g: g.name.lower())
+        pages = max(1, math.ceil(len(guilds) / self.PAGE_SIZE))
+        self.page = max(0, min(self.page, pages - 1))
+        chunk = guilds[self.page * self.PAGE_SIZE:(self.page + 1) * self.PAGE_SIZE]
+
+        remove_here = discord.ui.Button(label="Remove Bot From Viewed Server", style=discord.ButtonStyle.danger)
         remove_here.callback = self.remove_here_callback
         self.add_item(remove_here)
 
-        guilds = sorted(bot.guilds, key=lambda g: g.name.lower())[:25]
-        if guilds:
-            options = [
+        if pages > 1:
+            prev_btn = discord.ui.Button(label="◀ Servers", style=discord.ButtonStyle.secondary, disabled=self.page <= 0)
+            next_btn = discord.ui.Button(label="Servers ▶", style=discord.ButtonStyle.secondary, disabled=self.page >= pages - 1)
+
+            async def prev_cb(interaction: discord.Interaction):
+                self.page -= 1
+                self._build()
+                await interaction.response.edit_message(view=self)
+
+            async def next_cb(interaction: discord.Interaction):
+                self.page += 1
+                self._build()
+                await interaction.response.edit_message(view=self)
+
+            prev_btn.callback = prev_cb
+            next_btn.callback = next_cb
+            self.add_item(prev_btn)
+            self.add_item(next_btn)
+
+        if not chunk:
+            return
+
+        def options(mark_current: bool):
+            return [
                 discord.SelectOption(
-                    label=g.name[:100] or str(g.id),
+                    label=(g.name[:100] or str(g.id)),
                     value=str(g.id),
                     description=f"{g.member_count or 0:,} members"[:100],
+                    default=bool(mark_current and g.id == self.current_guild_id),
                 )
-                for g in guilds
+                for g in chunk
             ]
-            remove_select = discord.ui.Select(placeholder="Remove the bot from another server", options=options)
 
-            async def select_callback(interaction: discord.Interaction):
-                await self._ask_confirm(interaction, int(remove_select.values[0]))
+        view_select = discord.ui.Select(
+            placeholder=f"View stats of a server (page {self.page + 1}/{pages})", options=options(True)
+        )
 
-            remove_select.callback = select_callback
-            self.add_item(remove_select)
+        async def view_cb(interaction: discord.Interaction):
+            target = bot.get_guild(int(view_select.values[0]))
+            if target is None:
+                return await interaction.response.send_message("The bot is not in that server anymore.", ephemeral=True)
+            self.current_guild_id = target.id
+            self._build()
+            await interaction.response.edit_message(embed=build_bot_stats_embed(target), view=self)
+
+        view_select.callback = view_cb
+        self.add_item(view_select)
+
+        remove_select = discord.ui.Select(placeholder="Remove the bot from a server", options=options(False))
+
+        async def remove_cb(interaction: discord.Interaction):
+            await self._ask_confirm(interaction, int(remove_select.values[0]))
+
+        remove_select.callback = remove_cb
+        self.add_item(remove_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != DEVELOPER_ID:
@@ -2328,7 +3043,7 @@ class BotStatsView(discord.ui.View):
         await self._ask_confirm(interaction, self.current_guild_id)
 
 
-@bot_group.command(name="stats", description="[OWN] Bot roles, servers, server stats and authorization")
+@bot_group.command(name="stats", description="[OWN] Bot roles, servers, server stats and authorization (any server)")
 async def bot_stats_command(interaction: discord.Interaction):
     if interaction.user.id != DEVELOPER_ID:
         return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /bot stats.", ephemeral=True)
@@ -2343,10 +3058,107 @@ bot.tree.add_command(bot_group)
 
 
 # ======================================================
-# /antinuke
+# /anti-nuke  +  /nuke-restore
+#   /anti-nuke writes down everything it changes, /nuke-restore puts it back.
 # ======================================================
 
-@bot.tree.command(name="antinuke", description="Lock the server, remove recent bots/webhooks, revoke invites, and undo recent channel creations")
+def serialize_overwrites(channel: discord.abc.GuildChannel):
+    out = []
+    for target, overwrite in channel.overwrites.items():
+        allow, deny = overwrite.pair()
+        out.append({
+            "id": target.id,
+            "type": "role" if isinstance(target, discord.Role) else "member",
+            "allow": allow.value,
+            "deny": deny.value,
+        })
+    return out
+
+
+def snapshot_channel(ch: discord.abc.GuildChannel):
+    """Everything needed to rebuild a channel (not its messages - Discord cannot give those back)."""
+    snap = {
+        "id": ch.id,
+        "name": ch.name,
+        "position": ch.position,
+        "category_id": getattr(ch, "category_id", None),
+        "overwrites": serialize_overwrites(ch),
+    }
+    if isinstance(ch, discord.CategoryChannel):
+        snap["kind"] = "category"
+    elif isinstance(ch, discord.TextChannel):
+        snap.update(kind="text", topic=ch.topic, nsfw=ch.nsfw, slowmode_delay=ch.slowmode_delay)
+    elif isinstance(ch, discord.StageChannel):
+        snap.update(kind="stage")
+    elif isinstance(ch, discord.VoiceChannel):
+        snap.update(kind="voice", bitrate=ch.bitrate, user_limit=ch.user_limit)
+    elif isinstance(ch, discord.ForumChannel):
+        snap.update(kind="forum", topic=getattr(ch, "topic", None), nsfw=ch.nsfw, slowmode_delay=ch.slowmode_delay)
+    else:
+        return None
+    return snap
+
+
+def fix_locked_snapshot(snap_ch: dict, previous, everyone_id: int):
+    """/anti-nuke locks channels BEFORE deleting new ones, so put @everyone's send-messages back to what it was."""
+    items = snap_ch["overwrites"]
+    entry = next((i for i in items if i["type"] == "role" and i["id"] == everyone_id), None)
+    ow = discord.PermissionOverwrite.from_pair(
+        discord.Permissions(entry["allow"]) if entry else discord.Permissions.none(),
+        discord.Permissions(entry["deny"]) if entry else discord.Permissions.none(),
+    )
+    ow.send_messages = previous
+    if entry:
+        items.remove(entry)
+    if not ow.is_empty():
+        allow, deny = ow.pair()
+        items.append({"id": everyone_id, "type": "role", "allow": allow.value, "deny": deny.value})
+
+
+def rebuild_overwrites(guild: discord.Guild, items: list):
+    result = {}
+    for it in items:
+        target = guild.get_role(it["id"]) if it["type"] == "role" else guild.get_member(it["id"])
+        if target is None:
+            continue
+        result[target] = discord.PermissionOverwrite.from_pair(
+            discord.Permissions(it["allow"]), discord.Permissions(it["deny"])
+        )
+    return result
+
+
+async def recreate_channel(guild: discord.Guild, s: dict, id_map: dict):
+    overwrites = rebuild_overwrites(guild, s.get("overwrites", []))
+    reason = f"{BOT_NAME} /nuke-restore"
+    kind = s["kind"]
+
+    if kind == "category":
+        return await guild.create_category(s["name"], overwrites=overwrites, reason=reason)
+
+    kwargs = {"overwrites": overwrites, "reason": reason}
+    parent = None
+    if s.get("category_id"):
+        parent = id_map.get(s["category_id"]) or guild.get_channel(s["category_id"])
+    if isinstance(parent, discord.CategoryChannel):
+        kwargs["category"] = parent
+
+    if kind == "text":
+        return await guild.create_text_channel(
+            s["name"], topic=s.get("topic"), nsfw=bool(s.get("nsfw")), slowmode_delay=s.get("slowmode_delay") or 0, **kwargs
+        )
+    if kind == "voice":
+        bitrate = min(s.get("bitrate") or 64000, int(guild.bitrate_limit))
+        return await guild.create_voice_channel(s["name"], bitrate=bitrate, user_limit=s.get("user_limit") or 0, **kwargs)
+    if kind == "stage":
+        return await guild.create_stage_channel(s["name"], **kwargs)
+    if kind == "forum":
+        return await guild.create_forum(
+            s["name"], topic=s.get("topic"), nsfw=bool(s.get("nsfw")), slowmode_delay=s.get("slowmode_delay") or 0, **kwargs
+        )
+    return None
+
+
+@bot.tree.command(name="anti-nuke", description="Lock the server, remove recent bots/webhooks, revoke invites, and undo recent channel creations")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def antinuke_command(interaction: discord.Interaction):
@@ -2355,10 +3167,17 @@ async def antinuke_command(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+    gid = str(guild.id)
     now = discord.utils.utcnow()
     cutoff = now.timestamp() - ANTINUKE_WINDOW_SECONDS
 
     protected_channels = {ch.id for ch in await find_bot_channels(guild)}
+
+    # Keep one snapshot per server and MERGE into it, so running /anti-nuke twice never loses the originals.
+    snap = DATA["nuke_snapshots"].get(gid) or {
+        "started_at": int(time.time()), "by": interaction.user.id,
+        "locked": {}, "deleted": [], "invites": [], "kicked_bots": [], "webhooks": [],
+    }
 
     results = []
 
@@ -2367,8 +3186,10 @@ async def antinuke_command(interaction: discord.Interaction):
         try:
             overwrite = channel.overwrites_for(guild.default_role)
             if overwrite.send_messages is not False:
+                previous = overwrite.send_messages  # None (neutral) or True
                 overwrite.send_messages = False
-                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"{BOT_NAME} /antinuke")
+                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"{BOT_NAME} /anti-nuke")
+                snap["locked"].setdefault(str(channel.id), previous)
                 locked += 1
         except (discord.Forbidden, discord.HTTPException):
             continue
@@ -2382,7 +3203,8 @@ async def antinuke_command(interaction: discord.Interaction):
             member = guild.get_member(entry.target.id) if entry.target else None
             if member:
                 try:
-                    await member.kick(reason=f"{BOT_NAME} /antinuke - recently added bot")
+                    await member.kick(reason=f"{BOT_NAME} /anti-nuke - recently added bot")
+                    snap["kicked_bots"].append({"id": member.id, "name": member.name})
                     kicked += 1
                 except (discord.Forbidden, discord.HTTPException):
                     continue
@@ -2397,7 +3219,9 @@ async def antinuke_command(interaction: discord.Interaction):
         for wh in webhooks:
             if wh.created_at and wh.created_at.timestamp() >= cutoff:
                 try:
-                    await wh.delete(reason=f"{BOT_NAME} /antinuke")
+                    info = {"name": wh.name, "channel_id": wh.channel_id}
+                    await wh.delete(reason=f"{BOT_NAME} /anti-nuke")
+                    snap["webhooks"].append(info)
                     removed_webhooks += 1
                 except (discord.Forbidden, discord.HTTPException):
                     continue
@@ -2411,7 +3235,15 @@ async def antinuke_command(interaction: discord.Interaction):
         invites = await guild.invites()
         for invite in invites:
             try:
-                await invite.delete(reason=f"{BOT_NAME} /antinuke")
+                info = {
+                    "channel_id": invite.channel.id if invite.channel else None,
+                    "max_age": invite.max_age or 0,
+                    "max_uses": invite.max_uses or 0,
+                    "temporary": bool(invite.temporary),
+                    "code": invite.code,
+                }
+                await invite.delete(reason=f"{BOT_NAME} /anti-nuke")
+                snap["invites"].append(info)
                 revoked_invites += 1
             except (discord.Forbidden, discord.HTTPException):
                 continue
@@ -2428,7 +3260,14 @@ async def antinuke_command(interaction: discord.Interaction):
             channel = guild.get_channel(entry.target.id) if entry.target else None
             if channel and channel.id not in protected_channels:
                 try:
-                    await channel.delete(reason=f"{BOT_NAME} /antinuke - recently created channel")
+                    snap_ch = snapshot_channel(channel)
+                    if snap_ch is not None:
+                        prev = snap["locked"].get(str(channel.id), "missing")
+                        if prev != "missing":
+                            fix_locked_snapshot(snap_ch, prev, guild.default_role.id)
+                    await channel.delete(reason=f"{BOT_NAME} /anti-nuke - recently created channel")
+                    if snap_ch is not None:
+                        snap["deleted"].append(snap_ch)
                     deleted_channels += 1
                 except (discord.Forbidden, discord.HTTPException):
                     continue
@@ -2437,7 +3276,109 @@ async def antinuke_command(interaction: discord.Interaction):
     else:
         results.append(f"Deleted {deleted_channels} recently created channel(s).")
 
-    embed = discord.Embed(title="Antinuke Sweep Complete", description="\n".join(results), color=EMBED_COLOR)
+    if snap["locked"] or snap["deleted"] or snap["invites"] or snap["kicked_bots"] or snap["webhooks"]:
+        DATA["nuke_snapshots"][gid] = snap
+        save_data()
+        results.append("\nEverything was recorded. Run **/nuke-restore** to put it back.")
+
+    embed = discord.Embed(title="Anti-Nuke Sweep Complete", description="\n".join(results), color=EMBED_COLOR)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="nuke-restore", description="Undo the last /anti-nuke: unlock channels, recreate deleted channels and invites")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def nuke_restore_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    gid = str(guild.id)
+    snap = DATA["nuke_snapshots"].get(gid)
+    if not snap:
+        return await interaction.response.send_message(
+            "There is nothing to restore. Nothing was recorded by /anti-nuke in this server.", ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    lines = []
+
+    # 1) unlock the paused channels
+    unlocked = failed_unlock = 0
+    for cid, previous in snap["locked"].items():
+        channel = guild.get_channel(int(cid))
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.send_messages = previous
+            if overwrite.is_empty():
+                await channel.set_permissions(guild.default_role, overwrite=None, reason=f"{BOT_NAME} /nuke-restore")
+            else:
+                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"{BOT_NAME} /nuke-restore")
+            unlocked += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed_unlock += 1
+    lines.append(f"**Unlocked:** {unlocked} channel(s)" + (f" ({failed_unlock} failed)" if failed_unlock else "") + ".")
+
+    # 2) recreate deleted channels (categories first so their children can be placed back in them)
+    id_map: dict[int, discord.abc.GuildChannel] = {}
+    created, failed = [], []
+    ordered = sorted(snap["deleted"], key=lambda s: (0 if s["kind"] == "category" else 1, s.get("position", 0)))
+    for s in ordered:
+        try:
+            new = await recreate_channel(guild, s, id_map)
+        except (discord.Forbidden, discord.HTTPException):
+            new = None
+        if new is None:
+            failed.append(s["name"])
+            continue
+        id_map[s["id"]] = new
+        created.append(new)
+    for s in ordered:
+        new = id_map.get(s["id"])
+        if new is not None:
+            try:
+                await new.edit(position=s.get("position", 0), reason=f"{BOT_NAME} /nuke-restore")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+    if snap["deleted"]:
+        lines.append(f"**Recreated channels ({len(created)}/{len(snap['deleted'])}):** " + (_truncate_field([c.mention for c in created], 600) if created else "none"))
+        if failed:
+            lines.append("**Could not recreate:** " + ", ".join(f"`{n}`" for n in failed))
+        lines.append("-# Channel settings, permissions and positions are restored. Messages cannot be - Discord does not keep them.")
+
+    # 3) recreate revoked invites (they get NEW codes)
+    new_links = []
+    for inv in snap["invites"]:
+        channel = guild.get_channel(inv["channel_id"]) if inv.get("channel_id") else None
+        channel = channel or id_map.get(inv.get("channel_id"))
+        if channel is None or not hasattr(channel, "create_invite"):
+            continue
+        try:
+            new_inv = await channel.create_invite(
+                max_age=inv.get("max_age", 0), max_uses=inv.get("max_uses", 0),
+                temporary=inv.get("temporary", False), reason=f"{BOT_NAME} /nuke-restore",
+            )
+            new_links.append(new_inv.url)
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    if snap["invites"]:
+        lines.append(f"**Recreated invites:** {len(new_links)}/{len(snap['invites'])} (new codes)")
+        if new_links:
+            lines.append(_truncate_field(new_links, 500))
+
+    # 4) things that cannot be undone automatically
+    if snap["kicked_bots"]:
+        lines.append("**Kicked bots (re-invite them yourself):** " + ", ".join(f"{b['name']} (`{b['id']}`)" for b in snap["kicked_bots"]))
+    if snap["webhooks"]:
+        lines.append("**Deleted webhooks (their URLs cannot come back):** " + ", ".join(f"`{w['name']}`" for w in snap["webhooks"]))
+
+    DATA["nuke_snapshots"].pop(gid, None)
+    save_data()
+
+    embed = discord.Embed(title="Nuke Restore Complete", description="\n".join(lines), color=EMBED_COLOR)
+    embed.set_footer(text=BOT_NAME)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2692,6 +3633,23 @@ def track_join_view(info: dict):
     return view if view.children else None
 
 
+async def fill_region_later(t: dict, info: dict, msg: discord.Message):
+    """The alert goes out instantly WITHOUT the region; the region (slow lookup) is added to it afterwards."""
+    if not msg or info.get("region") or not info.get("place_id") or not info.get("job_id") or info.get("private"):
+        return
+    region = await detect_server_region(bot.session, info["place_id"], info["job_id"])
+    if not region:
+        return
+    info["region"] = region
+    # only edit if the alert is still the live "found" alert
+    if t.get("message_id") != msg.id or not t.get("sig"):
+        return
+    try:
+        await msg.edit(embed=build_track_embed(t, info, "found"))
+    except discord.HTTPException:
+        pass
+
+
 async def announce_found(t: dict, info: dict):
     channel = await resolve_snipe_channel(t)
     if channel is None:
@@ -2709,10 +3667,14 @@ async def announce_found(t: dict, info: dict):
         content = f"<@{t['added_by']}> `{who}` is now playing **{info.get('game', 'Unknown Game')}**."
 
     try:
-        return await channel.send(content=content, embed=build_track_embed(t, info, "found"), **kwargs)
+        msg = await channel.send(content=content, embed=build_track_embed(t, info, "found"), **kwargs)
     except discord.HTTPException as exc:
         print(f"[{BOT_NAME}] Could not send tracker alert: {exc}")
         return None
+
+    if t["kind"] == "hitlist" and not info.get("region"):
+        spawn(fill_region_later(t, info, msg))
+    return msg
 
 
 async def announce_left(t: dict):
@@ -2754,9 +3716,9 @@ async def process_tracker(t: dict, presence: dict | None):
             await announce_left(t)
 
         info = await presence_to_info(presence)
-        msg = await announce_found(t, info)
-        t["sig"] = sig
+        t["sig"] = sig  # set BEFORE sending so a slow send can never double-fire
         t["info"] = info
+        msg = await announce_found(t, info)
         t["message_id"] = msg.id if msg else None
         save_data()
         return
@@ -2787,11 +3749,10 @@ async def tracker_loop():
             return  # Roblox refused or failed this tick; try again next time
         presences.update(result)
 
-    for t in trackers:
-        try:
-            await process_tracker(t, presences.get(t["roblox_id"]))
-        except Exception as exc:
-            print(f"[{BOT_NAME}] Tracker error for {t.get('username')}: {exc}")
+    await asyncio.gather(
+        *(process_tracker(t, presences.get(t["roblox_id"])) for t in trackers),
+        return_exceptions=True,
+    )
 
 
 @tracker_loop.before_loop
@@ -2827,8 +3788,12 @@ class TrackerAddModal(discord.ui.Modal):
         if key in DATA["trackers"]:
             return await interaction.followup.send(f"**{roblox_name}** is already being tracked.", ephemeral=True)
 
-        display_name, _ = await roblox_user_details(session, roblox_id)
-        avatar = await roblox_avatar_url(session, roblox_id)
+        # Everything Roblox-related at the same time instead of one after the other.
+        (display_name, _), avatar, snap_presences = await asyncio.gather(
+            roblox_user_details(session, roblox_id),
+            roblox_avatar_url(session, roblox_id),
+            roblox_presence(session, [roblox_id]),
+        )
 
         t = {
             "kind": self.kind,
@@ -2846,15 +3811,14 @@ class TrackerAddModal(discord.ui.Modal):
         }
         DATA["trackers"][key] = t
 
-        # Already in a game right now? Do not wait for a new join: find them immediately.
+        # Already in a game right now? Alert IMMEDIATELY - no waiting for them to join a new server.
         found_now = False
-        snap_presences = await roblox_presence(session, [roblox_id])
         snap_p = (snap_presences or {}).get(roblox_id)
         if presence_in_game(snap_p):
             info = await presence_to_info(snap_p)
-            msg = await announce_found(t, info)
             t["sig"] = presence_sig(snap_p)
             t["info"] = info
+            msg = await announce_found(t, info)
             t["message_id"] = msg.id if msg else None
             found_now = msg is not None
         save_data()
@@ -2866,15 +3830,23 @@ class TrackerAddModal(discord.ui.Modal):
         text = f"Now tracking **{label}**. Alerts will be posted only in {where}."
         if found_now:
             text += f"\n**{roblox_name}** is already in a game, so the alert was posted in {where} right now."
+        elif snap_presences is not None:
+            text += f"\n**{roblox_name}** is not in a game at the moment. I check every {TRACKER_POLL_SECONDS}s and alert you the second they join."
         if not ROBLOX_COOKIE:
             text += (
                 "\n\n**Warning:** ROBLOX_COOKIE is not set in the bot's .env, so Roblox will probably "
                 "refuse presence checks and no alerts will appear until it is set."
             )
+        elif snap_presences is None:
+            text += "\n\n**Warning:** Roblox refused the presence check just now (bad/expired ROBLOX_COOKIE?). Try `/hitlist debug`."
 
-        # The target's whole Roblox profile.
-        profile_embed = await build_roblox_embed(session, roblox_id, roblox_name)
-        await interaction.followup.send(text, embed=profile_embed, ephemeral=True)
+        # Answer right away, THEN load the heavy full profile and attach it.
+        await interaction.followup.send(text, ephemeral=True)
+        try:
+            profile_embed = await build_roblox_embed(session, roblox_id, roblox_name)
+            await interaction.edit_original_response(content=text, embed=profile_embed)
+        except discord.HTTPException:
+            pass
 
 
 def find_tracker_key(guild_id: int, kind: str, username: str):
@@ -4210,6 +5182,155 @@ async def tickets_export_command(interaction: discord.Interaction, all_servers: 
 
 
 # ======================================================
+# DATA BACKUP / RESTORE  (keeps the global leaderboard history safe, even if the host wipes the disk)
+# ======================================================
+
+_last_backup_hash: str | None = None
+
+
+def data_payload() -> bytes:
+    return json.dumps(DATA, indent=2).encode("utf-8")
+
+
+async def send_backup_to_dev(force: bool = False, reason: str = "Scheduled backup") -> str:
+    """DM the developer the full data file. Skips when nothing changed since the last backup (unless forced)."""
+    global _last_backup_hash
+    payload = data_payload()
+    digest = hashlib.sha256(payload).hexdigest()
+    if not force and digest == _last_backup_hash:
+        return "unchanged"
+    if len(payload) > 9_500_000:
+        print(f"[{BOT_NAME}] Backup file is {len(payload)} bytes - too big to DM. Use /tickets-export or copy the file by hand.")
+        return "too_big"
+    try:
+        dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
+        stamp = time.strftime("%Y-%m-%d_%H%M", time.gmtime())
+        await dev.send(
+            f"**{BOT_NAME} data backup** - {reason}\n"
+            f"Global leaderboard members: `{len(DATA['stats']['global']):,}` | raids in history: `{len(DATA['global_history']):,}` | "
+            f"archived tickets: `{len(DATA['ticket_archive']):,}`\n"
+            "-# If the host ever wipes the bot's files, upload this file with /data-restore.",
+            file=discord.File(io.BytesIO(payload), filename=f"cruxer_backup_{stamp}.json"),
+        )
+        _last_backup_hash = digest
+        return "sent"
+    except discord.HTTPException as exc:
+        print(f"[{BOT_NAME}] Could not DM the backup to the developer (are your DMs open?): {exc}")
+        return "failed"
+
+
+@tasks.loop(hours=BACKUP_INTERVAL_HOURS)
+async def backup_loop():
+    await send_backup_to_dev(force=False)
+
+
+@backup_loop.before_loop
+async def before_backup_loop():
+    await bot.wait_until_ready()
+
+
+def merge_backup(incoming: dict) -> dict:
+    """Merge a backup into the live data WITHOUT ever lowering a number or deleting anything."""
+    added = {"leaderboard_users": 0, "archive": 0, "history": 0, "blacklist": 0, "links": 0}
+
+    # a plain /tickets-export file (ticket_key -> ticket) is accepted too
+    if "stats" not in incoming and incoming and all(isinstance(v, dict) and "raid_number" in v for v in incoming.values()):
+        incoming = {"ticket_archive": incoming}
+
+    g = DATA["stats"]["global"]
+    for uid, count in ((incoming.get("stats") or {}).get("global") or {}).items():
+        if isinstance(count, int) and count > g.get(uid, 0):
+            g[uid] = count
+            added["leaderboard_users"] += 1
+
+    for gid, users in ((incoming.get("stats") or {}).get("guilds") or {}).items():
+        dst = DATA["stats"]["guilds"].setdefault(gid, {})
+        for uid, count in (users or {}).items():
+            if isinstance(count, int) and count > dst.get(uid, 0):
+                dst[uid] = count
+
+    for key, ticket in (incoming.get("ticket_archive") or {}).items():
+        if key not in DATA["ticket_archive"]:
+            DATA["ticket_archive"][key] = ticket
+            added["archive"] += 1
+
+    known = {(h.get("ts"), h.get("guild_id"), h.get("raid_number")) for h in DATA["global_history"]}
+    for h in incoming.get("global_history") or []:
+        k = (h.get("ts"), h.get("guild_id"), h.get("raid_number"))
+        if k not in known:
+            DATA["global_history"].append(h)
+            known.add(k)
+            added["history"] += 1
+
+    for gid, count in (incoming.get("raid_counters") or {}).items():
+        if isinstance(count, int) and count > DATA["raid_counters"].get(gid, 0):
+            DATA["raid_counters"][gid] = count
+
+    for uid, entry in (incoming.get("blacklist") or {}).items():
+        if uid not in DATA["blacklist"]:
+            DATA["blacklist"][uid] = entry
+            added["blacklist"] += 1
+    for uid, entry in (incoming.get("links") or {}).items():
+        if uid not in DATA["links"]:
+            DATA["links"][uid] = entry
+            added["links"] += 1
+    for uid, entry in (incoming.get("configs") or {}).items():
+        DATA["configs"].setdefault(uid, entry)
+    for gid in incoming.get("authorized_guilds") or []:
+        if gid not in DATA["authorized_guilds"]:
+            DATA["authorized_guilds"].append(gid)
+
+    save_data()
+    merge_global_sources()  # also rebuilds totals from the (now bigger) archive
+    return added
+
+
+@bot.tree.command(name="data-backup", description="[OWN] DM yourself a full backup of Cruxer's data right now")
+@app_commands.guild_only()
+async def data_backup_command(interaction: discord.Interaction):
+    if not await require_owner(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    result = await send_backup_to_dev(force=True, reason="Manual backup")
+    texts = {
+        "sent": "Backup sent to your DMs.",
+        "failed": "I could not DM you. Open your DMs for server members and try again.",
+        "too_big": "The data file is too big to DM. Copy cruxer_data.json from the host instead.",
+    }
+    await interaction.followup.send(texts.get(result, "Done."), ephemeral=True)
+
+
+@bot.tree.command(name="data-restore", description="[OWN] Merge a Cruxer backup file back in (never lowers any count)")
+@app_commands.describe(file="A cruxer_backup_*.json / cruxer_data.json / cruxer_tickets.json file")
+@app_commands.guild_only()
+async def data_restore_command(interaction: discord.Interaction, file: discord.Attachment):
+    if not await require_owner(interaction):
+        return
+    if file.size > 25 * 1024 * 1024:
+        return await interaction.response.send_message("That file is too big.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        incoming = json.loads((await file.read()).decode("utf-8"))
+        if not isinstance(incoming, dict):
+            raise ValueError("not a JSON object")
+    except Exception as exc:
+        return await interaction.followup.send(f"That is not a valid backup file ({exc!r}).", ephemeral=True)
+
+    added = merge_backup(incoming)
+    await interaction.followup.send(
+        "Backup merged. Nothing was deleted or lowered.\n"
+        f"- Leaderboard members raised/added: `{added['leaderboard_users']}`\n"
+        f"- Archived tickets added: `{added['archive']}`\n"
+        f"- Raid history entries added: `{added['history']}`\n"
+        f"- Blacklist entries added: `{added['blacklist']}`\n"
+        f"- Linked accounts added: `{added['links']}`\n"
+        f"Global leaderboard now has `{len(DATA['stats']['global']):,}` members.",
+        ephemeral=True,
+    )
+
+
+# ======================================================
 # NEW SERVER / REMOVED / READY
 # ======================================================
 
@@ -4266,6 +5387,18 @@ async def on_ready():
     cookie_ok, cookie_text = await roblox_cookie_status(bot.session)
     print(f"[{BOT_NAME}] Roblox account check: {'OK' if cookie_ok else 'PROBLEM'} - {cookie_text}")
 
+    if DATA_WAS_FRESH and bot.guilds:
+        # The data file did not exist at start-up: either the very first run, or the host wiped the disk.
+        try:
+            dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
+            await dev.send(
+                f"**{BOT_NAME} started with NO data file.** If this is not the very first run, your host wiped the disk. "
+                "Upload your latest `cruxer_backup_*.json` with **/data-restore** and the global leaderboard history comes back. "
+                "To stop it happening, set CRUXER_DATA_FILE in your .env to a persistent folder."
+            )
+        except discord.HTTPException:
+            pass
+
     if not _commands_synced:
         _commands_synced = True
         await sync_all_commands()
@@ -4278,6 +5411,7 @@ async def on_ready():
             await ensure_snipe_channel(guild)
 
         # Prefer the channel where the panel/leaderboard currently lives (it may have been moved with /add).
+        # refresh_* removes the previous panel/leaderboard, including old legacy (embed) ones.
         panel_channel = (
             guild.get_channel(DATA["panel_channels"].get(gid, 0))
             or guild.get_channel(BATTLE_PANEL_CHANNEL_ID)
@@ -4299,6 +5433,12 @@ async def on_ready():
                 await refresh_leaderboard(leaderboard_channel)
             except discord.HTTPException:
                 pass
+
+    # Tickets that were open before this update get the new Edit button.
+    try:
+        await upgrade_open_tickets()
+    except Exception as exc:
+        print(f"[{BOT_NAME}] Could not upgrade open tickets: {exc!r}")
 
 
 # ======================================================
