@@ -32,12 +32,17 @@ Roblox features (/hitlist, /see, /whois, /frnd, join checks, helper warnings,
 request verification, automatic server link + region) need ROBLOX_COOKIE in
 your .env - the .ROBLOSECURITY cookie of a Roblox account (use a spare/alt
 account, never your main). Roblox's presence API refuses anonymous requests.
+WITHOUT a cookie, Raid/Backup requests still work: the member just pastes their
+server link and the in-game check is skipped.
 
 Optional .env values:
   RALVORA_API_URL / RALVORA_API_KEY  - a region API to try first (see detect_server_region)
   CRUXER_GLOBAL_FILE                 - where the extra global-leaderboard file lives
 
 Changes in this version (latest first):
+  - FIX: Raid/Backup requests no longer fail with "Server verification is offline" when
+    ROBLOX_COOKIE is missing (or Roblox can't be reached). The pasted server link is used
+    instead and the live in-game check is skipped. With a working cookie nothing changes.
   - .av [user]  (prefix command, also .avatar / .pfp): avatar + profile of a user
   - /anti-nuke (was /antinuke) now records everything it locks / deletes / revokes, and
     /nuke-restore puts the channels, locks and invites back
@@ -1114,13 +1119,26 @@ def parse_roblox_link(link: str):
 
 
 async def verify_requester(session: aiohttp.ClientSession, roblox_id: int, typed_link: str):
-    """Returns (ok, error_message, verified_join_link). typed_link may be empty (linked members)."""
+    """Returns (ok, error_message, verified_join_link). typed_link may be empty (linked members).
+
+    With a working ROBLOX_COOKIE the member must be in a joinable game right now and the link is
+    rebuilt from the live server. WITHOUT a cookie (or when Roblox cannot be reached) the live check
+    is impossible, so the member's own pasted roblox.com link is accepted instead.
+    """
+    typed_link = (typed_link or "").strip()
+
+    def fallback(why: str):
+        """Accept the pasted link when live verification is not possible."""
+        if typed_link and is_roblox_url(typed_link):
+            return True, None, typed_link
+        return False, f"{why} Paste your Roblox server link in the form and try again.", None
+
     if not ROBLOX_COOKIE:
-        return False, "Server verification is offline (the bot has no ROBLOX_COOKIE). Tell the developer.", None
+        return fallback("Live server verification is not enabled, so I need your server link.")
 
     presences = await roblox_presence(session, [roblox_id])
     if presences is None:
-        return False, "I could not reach Roblox to check that you are in a game. Try again in a moment.", None
+        return fallback("I could not reach Roblox to check that you are in a game.")
 
     p = presences.get(roblox_id)
     if not presence_in_game(p):
@@ -1134,7 +1152,7 @@ async def verify_requester(session: aiohttp.ClientSession, roblox_id: int, typed
             "Set your experience joins to **Everyone** in Roblox privacy settings, then try again."
         ), None
 
-    link_place, link_job = parse_roblox_link(typed_link or "")
+    link_place, link_job = parse_roblox_link(typed_link)
     if link_place and str(link_place) != str(place_id):
         return False, "That server link is for a different game than the one you are in.", None
     if link_job and link_job.lower() != str(job_id).lower():
@@ -1243,11 +1261,12 @@ class RequestModal(discord.ui.Modal):
             )
         roblox_id, roblox_name = roblox
 
-        # 2) They must be in a joinable game right now (and the typed link, if any, must match it)
+        # 2) They must be in a joinable game right now (and the typed link, if any, must match it).
+        #    Without a ROBLOX_COOKIE this falls back to the pasted server link.
         ok, error, verified_link = await verify_requester(interaction.client.session, roblox_id, link)
         if not ok:
             return await interaction.followup.send(error, ephemeral=True)
-        link = verified_link  # store the verified live join link
+        link = verified_link  # store the verified live join link (or the pasted link as a fallback)
 
         # 3) Region: use what they typed, otherwise detect it from the live server
         region = self.region.value.strip()
