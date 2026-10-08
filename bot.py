@@ -40,6 +40,14 @@ Optional .env values:
   CRUXER_GLOBAL_FILE                 - where the extra global-leaderboard file lives
 
 Changes in this version (latest first):
+  - NEW /search  (admin): finds who used ANOTHER bot's commands recently (default: last 60
+    minutes). Discord stamps every slash-command reply with the person who ran it, so the bot
+    reads that, lists who ran what (with a jump link and a preview of what the other bot posted)
+    and pings them. Options: application (only that bot), channel, minutes, ping.
+  - NEW /trust add  and  /trust remove  (developer only): add or remove a member by user ID.
+    Trusted members can use the [OWN] commands. /trust, /data-backup and /data-restore stay
+    developer-only, and /deauthorize, ticket re-open and the bot-leave confirmation too.
+  - The developer alone is exempt from the 2 requests / 24 hours limit (nobody else is).
   - FIX: Raid/Backup requests no longer fail with "Server verification is offline" when
     ROBLOX_COOKIE is missing (or Roblox can't be reached). The pasted server link is used
     instead and the live in-game check is skipped. With a working cookie nothing changes.
@@ -87,7 +95,8 @@ import secrets
 import shutil
 import time
 import uuid
-from datetime import datetime, timezone
+import warnings
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import discord
@@ -165,6 +174,10 @@ TICKET_MESS_THRESHOLD = 50      # "Ah, this is a real mess." after this many mes
 MESS_PREFIX = "**Ah, this is a real mess.**"
 BACKUP_INTERVAL_HOURS = 6       # DM the developer a data backup this often
 
+SEARCH_DEFAULT_MINUTES = 60     # /search looks this far back by default
+SEARCH_PER_CHANNEL_LIMIT = 500  # newest messages checked per channel by /search
+SEARCH_MAX_SHOWN = 20           # most people listed (and pinged) by one /search
+
 # ======================================================
 
 
@@ -216,6 +229,7 @@ def load_data():
     data.setdefault("ticket_archive", {})  # permanent copy of every ticket, never cleared
     data.setdefault("global_history", [])  # permanent, append-only list of every finished raid
     data.setdefault("nuke_snapshots", {})  # what /anti-nuke changed, so /nuke-restore can undo it
+    data.setdefault("trusted", {})  # members the developer trusted with the [OWN] commands (/trust add)
     return data
 
 
@@ -390,7 +404,19 @@ def get_rank(guild_id: int, user_id: int, scope: str):
     return None, 0, len(entries)
 
 
+# ---- trusted members (/trust add, /trust remove) ----
+
+def is_trusted(user_id: int) -> bool:
+    return str(user_id) in DATA["trusted"]
+
+
+def can_use_own(user_id: int) -> bool:
+    """The developer, or a member the developer added with /trust add."""
+    return user_id == DEVELOPER_ID or is_trusted(user_id)
+
+
 # ---- request limit: a 24h window that starts at the member's FIRST request ----
+# The developer alone is exempt: no limit, nothing is counted.
 
 def _active_window(guild_id: int, user_id: int):
     """Returns the member's live limit entry, or None when there is no active 24h window."""
@@ -404,6 +430,8 @@ def _active_window(guild_id: int, user_id: int):
 
 def rate_limit_status(guild_id: int, user_id: int, limit: int = DAILY_REQUEST_LIMIT):
     """Check the limit WITHOUT using up a request. Returns (allowed, used, resets_at_timestamp_or_None)."""
+    if user_id == DEVELOPER_ID:
+        return True, 0, None
     entry = _active_window(guild_id, user_id)
     if entry is None:
         return True, 0, None
@@ -411,7 +439,9 @@ def rate_limit_status(guild_id: int, user_id: int, limit: int = DAILY_REQUEST_LI
 
 
 def check_and_increment_rate_limit(guild_id: int, user_id: int, limit: int = DAILY_REQUEST_LIMIT):
-    """Uses one request. Returns (allowed, used, resets_at_timestamp)."""
+    """Uses one request. Returns (allowed, used, resets_at_timestamp). The developer is never limited."""
+    if user_id == DEVELOPER_ID:
+        return True, 0, None
     entry = _active_window(guild_id, user_id)
     if entry is None:
         entry = {"window_start": int(time.time()), "count": 0}
@@ -1164,15 +1194,22 @@ async def verify_requester(session: aiohttp.ClientSession, roblox_id: int, typed
 class DispatchView(discord.ui.LayoutView):
     """The 'Request Dispatched Successfully' card the member sees after making a ticket."""
 
-    def __init__(self, request_type: str, raid_number: int, channel: discord.TextChannel, used: int, resets: int):
+    def __init__(self, request_type: str, raid_number: int, channel: discord.TextChannel, used: int, resets: int | None):
         super().__init__(timeout=None)
-        remaining = max(0, DAILY_REQUEST_LIMIT - used)
+        if resets is None:
+            # the developer is exempt from the request limit
+            usage_text = "`Unlimited`"
+            resets_text = "Never"
+        else:
+            remaining = max(0, DAILY_REQUEST_LIMIT - used)
+            usage_text = f"`{used}/{DAILY_REQUEST_LIMIT} used ({remaining} remaining)`"
+            resets_text = f"<t:{resets}:R>"
         self.add_item(discord.ui.Container(
             discord.ui.TextDisplay(
                 f"**{request_type} Request [#{raid_number}] Dispatched Successfully!**\n\n"
                 f"- **Ticket Channel:** {channel.mention}\n"
-                f"- **Usage Status:** `{used}/{DAILY_REQUEST_LIMIT} used ({remaining} remaining)`\n"
-                f"- **Usage Resets:** <t:{resets}:R>\n\n"
+                f"- **Usage Status:** {usage_text}\n"
+                f"- **Usage Resets:** {resets_text}\n\n"
                 "-# All helpers have been notified. Tap the channel link above to view your live ticket."
             ),
         ))
@@ -1274,7 +1311,7 @@ class RequestModal(discord.ui.Modal):
             place_id, job_id = parse_roblox_link(link)
             region = await detect_server_region(interaction.client.session, place_id, job_id) or "Unknown"
 
-        # 4) Only now use up one of their requests
+        # 4) Only now use up one of their requests (the developer is never limited)
         allowed, count, resets = check_and_increment_rate_limit(guild.id, interaction.user.id)
         if not allowed:
             return await interaction.followup.send(rate_limit_text(count, resets), ephemeral=True)
@@ -2474,7 +2511,7 @@ async def leaderboard_command(interaction: discord.Interaction):
 @app_commands.describe(message="The message Cruxer should send")
 @app_commands.guild_only()
 async def say_command(interaction: discord.Interaction, message: str):
-    if interaction.user.id != DEVELOPER_ID:
+    if not can_use_own(interaction.user.id):
         return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     try:
@@ -2720,7 +2757,7 @@ async def member_stats_command(interaction: discord.Interaction, member: discord
 @bot.tree.command(name="authorize", description="[OWN] Set up Cruxer in this server")
 @app_commands.guild_only()
 async def authorize_command(interaction: discord.Interaction):
-    if interaction.user.id != DEVELOPER_ID:
+    if not can_use_own(interaction.user.id):
         return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /authorize.", ephemeral=True)
 
     guild = interaction.guild
@@ -2743,6 +2780,7 @@ async def authorize_command(interaction: discord.Interaction):
 @bot.tree.command(name="deauthorize", description="[OWN] Remove Cruxer's setup from this server and leave")
 @app_commands.guild_only()
 async def deauthorize_command(interaction: discord.Interaction):
+    # Developer only - this deletes channels and server data and makes the bot leave.
     if interaction.user.id != DEVELOPER_ID:
         return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /deauthorize.", ephemeral=True)
 
@@ -2960,6 +2998,7 @@ class ConfirmLeaveView(discord.ui.View):
         self.target_guild_id = target_guild_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Developer only: trusted members can look at /bot stats but cannot remove the bot from a server.
         if interaction.user.id != DEVELOPER_ID:
             await interaction.response.send_message(f"Only the {BOT_NAME} developer can do this.", ephemeral=True)
             return False
@@ -3060,7 +3099,7 @@ class BotStatsView(discord.ui.View):
         self.add_item(remove_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != DEVELOPER_ID:
+        if not can_use_own(interaction.user.id):
             await interaction.response.send_message(f"Only the {BOT_NAME} developer can use these controls.", ephemeral=True)
             return False
         return True
@@ -3080,7 +3119,7 @@ class BotStatsView(discord.ui.View):
 
 @bot_group.command(name="stats", description="[OWN] Bot roles, servers, server stats and authorization (any server)")
 async def bot_stats_command(interaction: discord.Interaction):
-    if interaction.user.id != DEVELOPER_ID:
+    if not can_use_own(interaction.user.id):
         return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /bot stats.", ephemeral=True)
 
     # Not ephemeral - everyone in the channel can see the result.
@@ -3435,8 +3474,11 @@ async def require_admin(interaction: discord.Interaction) -> bool:
     return False
 
 
-async def require_owner(interaction: discord.Interaction) -> bool:
-    if interaction.user.id == DEVELOPER_ID:
+async def require_owner(interaction: discord.Interaction, dev_only: bool = False) -> bool:
+    """The [OWN] commands: the developer, plus members added with /trust add.
+    dev_only=True keeps a command for the developer alone (used by /trust, /data-backup, /data-restore)."""
+    allowed = interaction.user.id == DEVELOPER_ID if dev_only else can_use_own(interaction.user.id)
+    if allowed:
         return True
     await interaction.response.send_message(f"Only the {BOT_NAME} developer can use this command.", ephemeral=True)
     return False
@@ -4038,7 +4080,7 @@ bot.tree.add_command(hitlist_group)
 
 
 # ======================================================
-# /blacklist add | remove   (owner only)
+# /blacklist add | remove   (owner / trusted)
 # ======================================================
 
 class BlacklistAddModal(discord.ui.Modal, title="Blacklist Member"):
@@ -4109,7 +4151,87 @@ bot.tree.add_command(blacklist_group)
 
 
 # ======================================================
-# /role add | remove   (owner only)
+# /trust add | remove   (developer only)
+#   A trusted member can use the [OWN] commands. Only the developer manages this list.
+# ======================================================
+
+trust_group = app_commands.Group(name="trust", description=f"[OWN] Let a member use {BOT_NAME}'s [OWN] commands", guild_only=True)
+
+
+@trust_group.command(name="add", description="[OWN] Trust a member (by user ID) so they can use the [OWN] commands")
+@app_commands.describe(user_id="Discord user ID of the member to trust")
+async def trust_add(interaction: discord.Interaction, user_id: str):
+    if not await require_owner(interaction, dev_only=True):
+        return
+
+    raw = user_id.strip()
+    if not raw.isdigit() or not (15 <= len(raw) <= 22):
+        return await interaction.response.send_message("That is not a valid Discord user ID.", ephemeral=True)
+
+    uid = int(raw)
+    if uid == DEVELOPER_ID:
+        return await interaction.response.send_message("You are the developer, you already have full access.", ephemeral=True)
+    if bot.user and uid == bot.user.id:
+        return await interaction.response.send_message("You cannot trust the bot itself.", ephemeral=True)
+    if raw in DATA["trusted"]:
+        return await interaction.response.send_message(
+            f"<@{uid}> (`{uid}`) is already trusted.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        user = await interaction.client.fetch_user(uid)
+    except discord.NotFound:
+        return await interaction.followup.send("I could not find a Discord user with that ID.", ephemeral=True)
+    except discord.HTTPException:
+        user = None
+    if user is not None and user.bot:
+        return await interaction.followup.send("Bots cannot be trusted.", ephemeral=True)
+
+    DATA["trusted"][raw] = {"added_by": interaction.user.id, "at": int(time.time())}
+    save_data()
+    log_audit("trust_add", interaction.guild.id, interaction.user.id, discord_id=uid)
+
+    name = f" (`{user.name}`)" if user else ""
+    await interaction.followup.send(
+        f"<@{uid}>{name} is now trusted and can use the [OWN] commands.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def trust_autocomplete(interaction: discord.Interaction, current: str):
+    choices = []
+    for uid in DATA["trusted"]:
+        cached = bot.get_user(int(uid))
+        label = f"{cached.name} ({uid})" if cached else uid
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=uid))
+    return choices[:25]
+
+
+@trust_group.command(name="remove", description="[OWN] Stop trusting a member")
+@app_commands.describe(user_id="Discord user ID to stop trusting")
+@app_commands.autocomplete(user_id=trust_autocomplete)
+async def trust_remove(interaction: discord.Interaction, user_id: str):
+    if not await require_owner(interaction, dev_only=True):
+        return
+    raw = user_id.strip()
+    if raw not in DATA["trusted"]:
+        return await interaction.response.send_message("That user is not trusted.", ephemeral=True)
+    DATA["trusted"].pop(raw, None)
+    save_data()
+    log_audit("trust_remove", interaction.guild.id, interaction.user.id, discord_id=int(raw) if raw.isdigit() else raw)
+    await interaction.response.send_message(
+        f"<@{raw}> (`{raw}`) is no longer trusted.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+bot.tree.add_command(trust_group)
+
+
+# ======================================================
+# /role add | remove   (owner / trusted)
 # ======================================================
 
 role_group = app_commands.Group(name="role", description="[OWN] Give or take roles", guild_only=True)
@@ -4212,7 +4334,7 @@ async def sync_all_commands():
 
 @bot.command(name="sync")
 async def sync_prefix_command(ctx: commands.Context):
-    if ctx.author.id != DEVELOPER_ID:
+    if not can_use_own(ctx.author.id):
         return
     await sync_all_commands()
     names = ", ".join(sorted(c.name for c in bot.tree.get_commands()))
@@ -4220,7 +4342,7 @@ async def sync_prefix_command(ctx: commands.Context):
 
 
 # ======================================================
-# /sync   (owner only)
+# /sync   (owner / trusted)
 # ======================================================
 
 @bot.tree.command(name="sync", description=f"[OWN] Re-register {BOT_NAME}'s slash commands in every server")
@@ -4287,12 +4409,15 @@ AUDIT_LABELS = {
     "see_remove": "See - Removed",
     "blacklist_add": "Blacklist - Added",
     "blacklist_remove": "Blacklist - Removed",
+    "trust_add": "Trust - Added",
+    "trust_remove": "Trust - Removed",
 }
 AUDIT_FILTERS = {
     "all": None,
     "hitlist": ("hitlist_add", "hitlist_remove"),
     "see": ("see_add", "see_remove"),
     "blacklist": ("blacklist_add", "blacklist_remove"),
+    "trust": ("trust_add", "trust_remove"),
 }
 AUDIT_PAGE_SIZE = 6
 
@@ -4336,7 +4461,7 @@ class AuditView(discord.ui.View):
             label = AUDIT_LABELS.get(e["action"], e["action"])
             lines = [f"**By:** <@{e['by']}>"]
 
-            if e["action"].startswith("blacklist"):
+            if e["action"].startswith(("blacklist", "trust")):
                 lines.append(f"**User:** <@{e['discord_id']}> (`{e['discord_id']}`)")
                 if e.get("reason"):
                     lines.append(f"**Reason:** {e['reason'][:200]}")
@@ -4353,7 +4478,7 @@ class AuditView(discord.ui.View):
         return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != DEVELOPER_ID:
+        if not can_use_own(interaction.user.id):
             await interaction.response.send_message(f"Only the {BOT_NAME} developer can use this.", ephemeral=True)
             return False
         return True
@@ -4367,13 +4492,14 @@ class AuditView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build(), view=self)
 
 
-@bot.tree.command(name="audit", description="[OWN] See hitlist / blacklist additions and removals")
+@bot.tree.command(name="audit", description="[OWN] See hitlist / blacklist / trust additions and removals")
 @app_commands.describe(filter="Which entries to show")
 @app_commands.choices(filter=[
     app_commands.Choice(name="Everything", value="all"),
     app_commands.Choice(name="Hitlist", value="hitlist"),
     app_commands.Choice(name="See (old entries)", value="see"),
     app_commands.Choice(name="Blacklist", value="blacklist"),
+    app_commands.Choice(name="Trust", value="trust"),
 ])
 @app_commands.guild_only()
 async def audit_command(interaction: discord.Interaction, filter: app_commands.Choice[str] = None):
@@ -4453,6 +4579,200 @@ async def view_command(interaction: discord.Interaction, member: discord.Member)
 
     embed.set_footer(text=BOT_NAME)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ======================================================
+# /search  (admin) - who used ANOTHER bot's command recently, and what did they run?
+#
+# How it works: when a bot answers a slash command, Discord stamps that reply with the
+# person who ran it (message.interaction_metadata). Cruxer reads the recent messages of
+# the other bot(s), lists who ran what, and pings them.
+# Limits (Discord's, not Cruxer's):
+#   - the typed arguments (the text given to /say) are not stored by Discord. You see the
+#     command name and what the bot POSTED, which is exactly the offending message.
+#   - messages a bot posts on its own with channel.send (not as a command reply) and prefix
+#     commands (!say) carry no stamp. For a prefix command Cruxer falls back to the message
+#     the bot replied to, when there is one.
+#   - ephemeral replies cannot be read by anyone but the person who ran the command.
+# ======================================================
+
+def message_preview(msg: discord.Message, limit: int = 160) -> str:
+    """A short, mention-safe preview of what a bot posted."""
+    text = (msg.content or "").strip()
+    if not text and msg.embeds:
+        e = msg.embeds[0]
+        text = (e.description or e.title or "").strip()
+    if not text:
+        parts = [c.content for c in _walk_components(msg.components) if isinstance(getattr(c, "content", None), str)]
+        text = " ".join(parts).strip()
+    if not text and msg.attachments:
+        text = f"[{len(msg.attachments)} attachment(s)]"
+    text = discord.utils.escape_mentions(text).replace("\n", " ").replace("`", "'")
+    if len(text) > limit:
+        text = text[:limit - 3] + "..."
+    return text or "[no text]"
+
+
+def find_invoker(msg: discord.Message):
+    """Who ran the command that produced this bot message? Returns (user, command_label, how) or None."""
+    meta = getattr(msg, "interaction_metadata", None)
+    user = getattr(meta, "user", None) if meta is not None else None
+    if user is not None:
+        name = getattr(meta, "name", None)
+        if not name:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    legacy = msg.interaction
+                name = getattr(legacy, "name", None) if legacy else None
+            except Exception:
+                name = None
+        kind = getattr(getattr(meta, "type", None), "name", "") or ""
+        if name:
+            label = f"`/{name}`"
+        else:
+            label = {
+                "application_command": "a slash command",
+                "component": "a button or menu",
+                "modal_submit": "a form",
+            }.get(kind, "an interaction")
+        return user, label, "slash"
+
+    # Prefix commands: many bots reply to the message that triggered them.
+    ref = msg.reference
+    resolved = ref.resolved if ref else None
+    if isinstance(resolved, discord.Message) and not resolved.author.bot:
+        typed = (resolved.content or "").strip().replace("`", "'")
+        typed = discord.utils.escape_mentions(typed)[:60] or "a message"
+        return resolved.author, f"`{typed}` (probably a prefix command)", "reply"
+
+    return None
+
+
+@bot.tree.command(name="search", description="Find who used another bot's commands recently, what they ran, and ping them")
+@app_commands.describe(
+    application="Only check messages posted by this bot (default: every bot)",
+    channel="Only search this channel (default: every channel I can read)",
+    minutes=f"How far back to look in minutes (default {SEARCH_DEFAULT_MINUTES})",
+    ping="Ping the people found (default: yes)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def search_command(
+    interaction: discord.Interaction,
+    application: discord.User = None,
+    channel: discord.TextChannel = None,
+    minutes: app_commands.Range[int, 1, 1440] = SEARCH_DEFAULT_MINUTES,
+    ping: bool = True,
+):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer()  # public on purpose, so the pings actually notify
+    after = discord.utils.utcnow() - timedelta(minutes=minutes)
+
+    if channel is not None:
+        candidates = [channel]
+    else:
+        candidates = list(guild.text_channels) + list(guild.threads)
+    channels = []
+    for ch in candidates:
+        perms = ch.permissions_for(guild.me)
+        if perms.view_channel and perms.read_message_history:
+            channels.append(ch)
+
+    hits = []
+    scanned = 0
+    for ch in channels:
+        try:
+            async for msg in ch.history(limit=SEARCH_PER_CHANNEL_LIMIT, after=after, oldest_first=False):
+                scanned += 1
+                if not msg.author.bot or msg.author.id == bot.user.id:
+                    continue
+                if application is not None and msg.author.id != application.id:
+                    continue
+                found = find_invoker(msg)
+                if found is None:
+                    continue
+                user, label, how = found
+                if user.bot:
+                    continue
+                hits.append({
+                    "ts": int(msg.created_at.timestamp()),
+                    "user": user,
+                    "label": label,
+                    "how": how,
+                    "app": msg.author.display_name,
+                    "channel": ch,
+                    "url": msg.jump_url,
+                    "preview": message_preview(msg),
+                })
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    hits.sort(key=lambda h: h["ts"], reverse=True)
+    window = f"the last {minutes} minute(s)"
+    scope = f"in {channel.mention}" if channel else "across the server"
+    who = f" from **{discord.utils.escape_markdown(application.display_name)}**" if application else " from bots"
+
+    if not hits:
+        embed = discord.Embed(
+            title="Command Search",
+            description=(
+                f"No command replies{who} {scope} in {window}.\n\n"
+                "-# I can only trace a message that the other bot posted as the reply to a slash command "
+                "(Discord stamps those with the person who ran it). Messages a bot posts on its own, "
+                "ephemeral replies and older messages cannot be traced - try a bigger `minutes` value, "
+                "or check that bot's own log channel."
+            ),
+            color=EMBED_COLOR,
+        )
+        embed.set_footer(text=f"{BOT_NAME} - {scanned:,} message(s) checked")
+        return await interaction.followup.send(embed=embed)
+
+    shown = []
+    blocks = []
+    size = 0
+    for h in hits:
+        if len(shown) >= SEARCH_MAX_SHOWN:
+            break
+        u = h["user"]
+        block = (
+            f"**{len(shown) + 1}.** <@{u.id}> (`{u.name}` / `{u.id}`) ran {h['label']} on "
+            f"**{discord.utils.escape_markdown(h['app'])}**\n"
+            f"-# <t:{h['ts']}:R> in {h['channel'].mention} - [Jump to message]({h['url']})\n"
+            f"> {h['preview']}\n"
+        )
+        if size + len(block) > 3800:
+            break
+        shown.append(h)
+        blocks.append(block)
+        size += len(block)
+
+    embed = discord.Embed(
+        title="Command Search",
+        description=f"Found **{len(hits)}** command reply(ies){who} {scope} in {window}.\n\n" + "\n".join(blocks),
+        color=EMBED_COLOR,
+    )
+    footer = f"{BOT_NAME} - {scanned:,} message(s) checked"
+    if len(hits) > len(shown):
+        footer += f" - showing {len(shown)} of {len(hits)}, narrow it with application / channel / minutes"
+    embed.set_footer(text=footer)
+
+    unique_users = []
+    for h in shown:
+        if h["user"].id not in [u.id for u in unique_users]:
+            unique_users.append(h["user"])
+
+    if ping:
+        content = "Pinging: " + " ".join(f"<@{u.id}>" for u in unique_users)
+        allowed = discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(id=u.id) for u in unique_users])
+    else:
+        content = None
+        allowed = discord.AllowedMentions.none()
+
+    await interaction.followup.send(content=content, embed=embed, allowed_mentions=allowed)
 
 
 # ======================================================
@@ -5058,7 +5378,7 @@ async def see_command(interaction: discord.Interaction, username: str):
 
 
 # ======================================================
-# /whois  (owner only, PUBLIC reply)
+# /whois  (owner / trusted, PUBLIC reply)
 # ======================================================
 
 @bot.tree.command(name="whois", description="[OWN] Full Roblox profile and Discord info for a member or Roblox user")
@@ -5167,7 +5487,7 @@ async def whois_command(interaction: discord.Interaction, member: discord.Member
 
 
 # ======================================================
-# /frnd request  (owner only)
+# /frnd request  (owner / trusted)
 #   Roblox: friend request from the bot's Roblox account (ROBLOX_COOKIE).
 #   Discord: bots are not allowed to send friend requests, so the member gets a DM
 #            with a button that opens your profile so they can add you.
@@ -5264,7 +5584,7 @@ bot.tree.add_command(frnd_group)
 
 
 # ======================================================
-# /tickets-export  (owner only) - permanent ticket archive
+# /tickets-export  (owner / trusted) - permanent ticket archive
 # ======================================================
 
 @bot.tree.command(name="tickets-export", description="[OWN] Download every stored ticket as a JSON file")
@@ -5383,6 +5703,8 @@ def merge_backup(incoming: dict) -> dict:
     for gid in incoming.get("authorized_guilds") or []:
         if gid not in DATA["authorized_guilds"]:
             DATA["authorized_guilds"].append(gid)
+    # NOTE: the trusted list is deliberately NOT merged from a backup, so restoring an old file
+    # can never silently give someone access you already took away. Re-add people with /trust add.
 
     save_data()
     merge_global_sources()  # also rebuilds totals from the (now bigger) archive
@@ -5392,7 +5714,7 @@ def merge_backup(incoming: dict) -> dict:
 @bot.tree.command(name="data-backup", description="[OWN] DM yourself a full backup of Cruxer's data right now")
 @app_commands.guild_only()
 async def data_backup_command(interaction: discord.Interaction):
-    if not await require_owner(interaction):
+    if not await require_owner(interaction, dev_only=True):
         return
     await interaction.response.defer(ephemeral=True)
     result = await send_backup_to_dev(force=True, reason="Manual backup")
@@ -5408,7 +5730,7 @@ async def data_backup_command(interaction: discord.Interaction):
 @app_commands.describe(file="A cruxer_backup_*.json / cruxer_data.json / cruxer_tickets.json file")
 @app_commands.guild_only()
 async def data_restore_command(interaction: discord.Interaction, file: discord.Attachment):
-    if not await require_owner(interaction):
+    if not await require_owner(interaction, dev_only=True):
         return
     if file.size > 25 * 1024 * 1024:
         return await interaction.response.send_message("That file is too big.", ephemeral=True)
