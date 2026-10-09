@@ -11,6 +11,8 @@ The bot also needs these server permissions to use every feature below:
 Manage Channels, Manage Roles, Manage Webhooks, Manage Guild (for invites),
 Kick Members, View Audit Log, Embed Links, Attach Files, Read Message History,
 Create Instant Invite (for /nuke-restore to recreate invites).
+For /setup and the Tier roles the bot's own role must sit ABOVE the Tier-1..Tier-5 roles
+(and above the ping roles) in Server Settings > Roles, and it needs Manage Roles.
 
 Data (raid numbers, ticket info, stats, panel/leaderboard message ids,
 rate limits, win streaks, saved configuration, the permanent ticket archive)
@@ -40,6 +42,21 @@ Optional .env values:
   CRUXER_GLOBAL_FILE                 - where the extra global-leaderboard file lives
 
 Changes in this version (latest first):
+  - NEW /setup  (admin): turns on the new ticket system in the server it is run in:
+      * creates the roles |Raid Ping| and |Backup Ping| (and Tier-1..Tier-5) if they do not exist
+      * a new ticket pings |Raid Ping| for a Raid and |Backup Ping| for a Backup, together with
+        the main information embed
+      * Tier roles are given automatically for assisting in RAIDS only (backups do not count):
+        Tier-5 = 5 raids, Tier-4 = 25, Tier-3 = 50, Tier-2 = 75, Tier-1 = 100
+        (change TIER_RAIDS_NEEDED below if you want other numbers)
+      * the 24 hour request limit now depends on the Tier role:
+        Tier-1 = 10, Tier-2 = 7, Tier-3 = 5, Tier-4 = 3, Tier-5 = 3 (everyone else = 2)
+      * Raid and Backup tickets are numbered separately and named "Raid-ticket #1" /
+        "Backup-ticket #1" (the channel is raid-ticket-1 / backup-ticket-1 because Discord
+        forces channel names to lowercase without spaces)
+      * the helper offline reminder (5 minutes) and the "Ah, this is a real mess." notice (every
+        50 messages, with a Jump to Information button) are part of the system and stay on
+    Servers that never ran /setup keep working exactly as before.
   - NEW /search  (admin): finds who used ANOTHER bot's commands recently (default: last 60
     minutes). Discord stamps every slash-command reply with the person who ran it, so the bot
     reads that, lists who ran what (with a jump link and a preview of what the other bot posted)
@@ -125,7 +142,7 @@ MVPS_CHANNEL_ID = 1554551411214131351
 SNIPE_CHANNEL_ID = 1555445538566967296
 
 VIEWER_ROLE_ID = 0
-PING_ROLE_ID = 0
+PING_ROLE_ID = 0  # old single ping role; only used as a fallback when /setup has not been run
 
 EMBED_COLOR = 0x2B2D31
 
@@ -156,7 +173,7 @@ GLOBAL_FILE = os.getenv("CRUXER_GLOBAL_FILE") or os.path.join(os.path.dirname(os
 
 LEADERBOARD_PAGE_SIZE = 10
 DURATION_UPDATE_SECONDS = 30
-DAILY_REQUEST_LIMIT = 2
+DAILY_REQUEST_LIMIT = 2  # members without a Tier role
 RATE_WINDOW_SECONDS = 24 * 60 * 60  # window starts at the member's first request
 ANTINUKE_WINDOW_SECONDS = 600  # look back 10 minutes for recent activity
 
@@ -177,6 +194,26 @@ BACKUP_INTERVAL_HOURS = 6       # DM the developer a data backup this often
 SEARCH_DEFAULT_MINUTES = 60     # /search looks this far back by default
 SEARCH_PER_CHANNEL_LIMIT = 500  # newest messages checked per channel by /search
 SEARCH_MAX_SHOWN = 20           # most people listed (and pinged) by one /search
+
+# ---- /setup system: typed ping roles, Tier roles, tier request limits ----
+RAID_PING_ROLE_ID = 1558114795536908418
+BACKUP_PING_ROLE_ID = 1558114863723716790
+RAID_PING_ROLE_NAME = "|Raid Ping|"
+BACKUP_PING_ROLE_NAME = "|Backup Ping|"
+
+# Tier role ids, in order Tier-1 .. Tier-5. If a role with that id does not exist in a server,
+# the bot looks for a role named "Tier-1" .. "Tier-5" instead (and /setup creates it if missing).
+TIER_ROLE_IDS = {
+    1: 1558116206849032242,
+    2: 1558116306555772968,
+    3: 1558116358791888956,
+    4: 1558116403872145460,
+    5: 1558116452618346557,
+}
+# RAID assists needed for each tier (backups do NOT count)
+TIER_RAIDS_NEEDED = {5: 5, 4: 25, 3: 50, 2: 75, 1: 100}
+# requests allowed per 24 hours for each tier
+TIER_DAILY_LIMITS = {1: 10, 2: 7, 3: 5, 4: 3, 5: 3}
 
 # ======================================================
 
@@ -213,6 +250,7 @@ def load_data():
     data["stats"].setdefault("guilds", {})
     data["stats"].setdefault("global", {})
     data["stats"].setdefault("daily", {})
+    data["stats"].setdefault("raid_assists", {})  # RAID-only assists per server (drives the Tier roles)
     data.setdefault("panel_messages", {})
     data.setdefault("leaderboard_messages", {})
     data.setdefault("authorized_guilds", [])
@@ -230,6 +268,8 @@ def load_data():
     data.setdefault("global_history", [])  # permanent, append-only list of every finished raid
     data.setdefault("nuke_snapshots", {})  # what /anti-nuke changed, so /nuke-restore can undo it
     data.setdefault("trusted", {})  # members the developer trusted with the [OWN] commands (/trust add)
+    data.setdefault("setup_guilds", [])  # servers where /setup was run (typed pings, tiers, typed ticket names)
+    data.setdefault("type_counters", {})  # per server: separate ticket numbers for Raid and Backup
     return data
 
 
@@ -321,10 +361,35 @@ merge_global_sources()
 
 
 def next_raid_number(guild_id: int) -> int:
+    """The internal, server-wide unique ticket id (Raid and Backup share it)."""
     gid = str(guild_id)
     DATA["raid_counters"][gid] = DATA["raid_counters"].get(gid, 0) + 1
     save_data()
     return DATA["raid_counters"][gid]
+
+
+def next_type_number(guild_id: int, request_type: str) -> int:
+    """The number shown to people: Raid and Backup are counted separately (Raid-ticket #1, Backup-ticket #1)."""
+    counters = DATA["type_counters"].setdefault(str(guild_id), {})
+    counters[request_type] = counters.get(request_type, 0) + 1
+    save_data()
+    return counters[request_type]
+
+
+def is_setup(guild_id: int) -> bool:
+    """True once /setup was run in this server."""
+    return guild_id in DATA["setup_guilds"]
+
+
+def ticket_number(ticket: dict) -> int:
+    return ticket.get("type_number") or ticket["raid_number"]
+
+
+def ticket_label(ticket: dict) -> str:
+    """'Raid-ticket #1' for tickets made after /setup, 'Raid #13' for older ones."""
+    if ticket.get("type_number"):
+        return f"{ticket['type']}-ticket #{ticket['type_number']}"
+    return f"{ticket['type']} #{ticket['raid_number']}"
 
 
 def get_ticket(channel_id: int):
@@ -345,10 +410,11 @@ def today_str() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def add_raid_credit(guild_id: int, user_ids, raid_number=None, result=None, guild_name=None):
+def add_raid_credit(guild_id: int, user_ids, raid_number=None, result=None, guild_name=None, is_raid: bool = False):
     gid = str(guild_id)
     guild_stats = DATA["stats"]["guilds"].setdefault(gid, {})
     global_stats = DATA["stats"]["global"]
+    raid_only = DATA["stats"]["raid_assists"].setdefault(gid, {})
 
     # Daily stats: keep only today's bucket so the file does not grow forever.
     today = today_str()
@@ -362,6 +428,8 @@ def add_raid_credit(guild_id: int, user_ids, raid_number=None, result=None, guil
         guild_stats[uid] = guild_stats.get(uid, 0) + 1
         global_stats[uid] = global_stats.get(uid, 0) + 1
         daily_stats[uid] = daily_stats.get(uid, 0) + 1
+        if is_raid:
+            raid_only[uid] = raid_only.get(uid, 0) + 1  # only RAIDS count towards the Tier roles
 
     # Permanent history entry (never trimmed, never touched by /deauthorize).
     DATA["global_history"].append({
@@ -381,6 +449,11 @@ def get_raid_count(guild_id: int, user_id: int, scope: str) -> int:
     if scope == "global":
         return DATA["stats"]["global"].get(str(user_id), 0)
     return DATA["stats"]["guilds"].get(str(guild_id), {}).get(str(user_id), 0)
+
+
+def get_raid_only_count(guild_id: int, user_id: int) -> int:
+    """Assists in RAIDS only (backups are not counted). Used for the Tier roles."""
+    return DATA["stats"]["raid_assists"].get(str(guild_id), {}).get(str(user_id), 0)
 
 
 def leaderboard_entries(guild_id: int, scope: str):
@@ -459,9 +532,110 @@ def check_and_increment_rate_limit(guild_id: int, user_id: int, limit: int = DAI
     return True, entry["count"], resets
 
 
-def rate_limit_text(count: int, resets) -> str:
+def rate_limit_text(count: int, resets, limit: int = DAILY_REQUEST_LIMIT) -> str:
     when = f" Your requests reset <t:{resets}:R>." if resets else ""
-    return f"Rate limit reached ({count}/{DAILY_REQUEST_LIMIT}).{when}"
+    return f"Rate limit reached ({count}/{limit}).{when}"
+
+
+# ---- Tier roles + typed ping roles (all of this is switched on per server by /setup) ----
+
+def find_named_role(guild: discord.Guild, role_id: int, name: str):
+    """A role by id first, then by name (case-insensitive)."""
+    role = guild.get_role(role_id) if role_id else None
+    if role is None:
+        wanted = name.lower()
+        role = discord.utils.find(lambda r: r.name.lower() == wanted, guild.roles)
+    return role
+
+
+def ping_role_for(guild: discord.Guild, request_type: str):
+    """|Raid Ping| for a Raid, |Backup Ping| for a Backup."""
+    if request_type == "Raid":
+        return find_named_role(guild, RAID_PING_ROLE_ID, RAID_PING_ROLE_NAME)
+    return find_named_role(guild, BACKUP_PING_ROLE_ID, BACKUP_PING_ROLE_NAME)
+
+
+def tier_role(guild: discord.Guild, tier: int):
+    return find_named_role(guild, TIER_ROLE_IDS[tier], f"Tier-{tier}")
+
+
+def member_tier(member):
+    """The member's BEST Tier (1 is the best, 5 the lowest), or None when they have no Tier role."""
+    guild = getattr(member, "guild", None)
+    roles = getattr(member, "roles", None)
+    if guild is None or roles is None:
+        return None
+    for tier in sorted(TIER_ROLE_IDS):
+        role = tier_role(guild, tier)
+        if role is not None and role in roles:
+            return tier
+    return None
+
+
+def tier_for_raids(raids: int):
+    """Which Tier a number of raid assists earns (None = not enough for Tier-5 yet)."""
+    for tier in sorted(TIER_RAIDS_NEEDED):  # Tier-1 first
+        if raids >= TIER_RAIDS_NEEDED[tier]:
+            return tier
+    return None
+
+
+def request_limit_for(member) -> int:
+    """Requests per 24 hours: by Tier role once /setup was run, otherwise the normal limit."""
+    guild = getattr(member, "guild", None)
+    if guild is None or not is_setup(guild.id):
+        return DAILY_REQUEST_LIMIT
+    return TIER_DAILY_LIMITS.get(member_tier(member), DAILY_REQUEST_LIMIT)
+
+
+async def sync_tier_role(guild: discord.Guild, member: discord.Member):
+    """Give the member the Tier role their raid assists earned. Never takes away a better role they already have.
+    Returns the new tier number when the member moved up, otherwise None."""
+    if not is_setup(guild.id):
+        return None
+    earned = tier_for_raids(get_raid_only_count(guild.id, member.id))
+    if earned is None:
+        return None
+    current = member_tier(member)
+    if current is not None and current <= earned:
+        return None  # already has this tier (or a better one)
+
+    target = tier_role(guild, earned)
+    if target is None:
+        return None
+    others = [r for r in (tier_role(guild, t) for t in TIER_ROLE_IDS) if r is not None and r != target and r in member.roles]
+    try:
+        if others:
+            await member.remove_roles(*others, reason=f"{BOT_NAME} tier update")
+        await member.add_roles(target, reason=f"{BOT_NAME} tier update - {get_raid_only_count(guild.id, member.id)} raid assists")
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        print(f"[{BOT_NAME}] Could not give {target.name} to {member} in {guild.name}: {exc}")
+        return None
+    return earned
+
+
+async def award_tier_roles(guild: discord.Guild, user_ids):
+    """After a raid: update the Tier role of every helper and post promotions in #logs."""
+    promoted = []
+    for uid in user_ids:
+        member = guild.get_member(int(uid))
+        if member is None:
+            continue
+        new_tier = await sync_tier_role(guild, member)
+        if new_tier:
+            promoted.append((member, new_tier))
+    if not promoted:
+        return
+    logs_channel = await get_logs_channel(guild)
+    if not logs_channel:
+        return
+    lines = [f"<@{m.id}> reached **Tier-{t}** ({get_raid_only_count(guild.id, m.id)} raid assists)" for m, t in promoted]
+    embed = discord.Embed(title="Tier Promotion", description="\n".join(lines), color=EMBED_COLOR)
+    embed.set_footer(text=BOT_NAME)
+    try:
+        await logs_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        pass
 
 
 def update_win_streak(guild_id: int, result: str) -> int:
@@ -489,8 +663,12 @@ def format_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
-def ticket_channel_name(raid_number: int) -> str:
-    return f"ticket-no-{raid_number}"
+def ticket_channel_name(ticket: dict) -> str:
+    """raid-ticket-1 / backup-ticket-1 for tickets made after /setup, ticket-no-13 for older ones.
+    (Discord forces channel names to lowercase with no spaces.)"""
+    if ticket.get("type_number"):
+        return f"{ticket['type'].lower()}-ticket-{ticket['type_number']}"
+    return f"ticket-no-{ticket['raid_number']}"
 
 
 def box(text: str) -> str:
@@ -1027,9 +1205,10 @@ async def start_request_flow(interaction: discord.Interaction, request_type: str
             f"{BOT_NAME} is not authorized in this server yet. Ask the developer to run /authorize.", ephemeral=True
         )
 
-    allowed, count, resets = rate_limit_status(interaction.guild.id, interaction.user.id)
+    limit = request_limit_for(interaction.user)
+    allowed, count, resets = rate_limit_status(interaction.guild.id, interaction.user.id, limit)
     if not allowed:
-        return await interaction.response.send_message(rate_limit_text(count, resets), ephemeral=True)
+        return await interaction.response.send_message(rate_limit_text(count, resets, limit), ephemeral=True)
 
     state, prefilled_link = "skip", None
     try:
@@ -1096,7 +1275,8 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
                 "- **No Fake Alerts**: Fake alerts will result in a blacklist.\n"
                 "- **Active Profile**: Request from the Roblox account you are currently using.\n"
                 "- **Assist Others**: Earn rescue ranks by helping other players.\n"
-                f"- **Limit**: {DAILY_REQUEST_LIMIT} requests per member every 24 hours."
+                f"- **Limit**: {DAILY_REQUEST_LIMIT} requests per member every 24 hours. "
+                "Higher Tier roles (earned by assisting in raids) get more."
             ),
             discord.ui.Separator(),
             discord.ui.TextDisplay(
@@ -1194,19 +1374,19 @@ async def verify_requester(session: aiohttp.ClientSession, roblox_id: int, typed
 class DispatchView(discord.ui.LayoutView):
     """The 'Request Dispatched Successfully' card the member sees after making a ticket."""
 
-    def __init__(self, request_type: str, raid_number: int, channel: discord.TextChannel, used: int, resets: int | None):
+    def __init__(self, ticket: dict, channel: discord.TextChannel, used: int, resets: int | None, limit: int = DAILY_REQUEST_LIMIT):
         super().__init__(timeout=None)
         if resets is None:
             # the developer is exempt from the request limit
             usage_text = "`Unlimited`"
             resets_text = "Never"
         else:
-            remaining = max(0, DAILY_REQUEST_LIMIT - used)
-            usage_text = f"`{used}/{DAILY_REQUEST_LIMIT} used ({remaining} remaining)`"
+            remaining = max(0, limit - used)
+            usage_text = f"`{used}/{limit} used ({remaining} remaining)`"
             resets_text = f"<t:{resets}:R>"
         self.add_item(discord.ui.Container(
             discord.ui.TextDisplay(
-                f"**{request_type} Request [#{raid_number}] Dispatched Successfully!**\n\n"
+                f"**{ticket['type']} Request [#{ticket_number(ticket)}] Dispatched Successfully!**\n\n"
                 f"- **Ticket Channel:** {channel.mention}\n"
                 f"- **Usage Status:** {usage_text}\n"
                 f"- **Usage Resets:** {resets_text}\n\n"
@@ -1284,9 +1464,11 @@ class RequestModal(discord.ui.Modal):
                     f"You already have an open request: {existing.mention}", ephemeral=True
                 )
 
-        allowed, count, resets = rate_limit_status(guild.id, interaction.user.id)
+        # The limit depends on the member's Tier role (only after /setup was run in this server).
+        limit = request_limit_for(interaction.user)
+        allowed, count, resets = rate_limit_status(guild.id, interaction.user.id, limit)
         if not allowed:
-            return await interaction.followup.send(rate_limit_text(count, resets), ephemeral=True)
+            return await interaction.followup.send(rate_limit_text(count, resets, limit), ephemeral=True)
 
         # 1) The Roblox profile must exist
         typed_name = self.username.value.strip().lstrip("@")
@@ -1312,35 +1494,19 @@ class RequestModal(discord.ui.Modal):
             region = await detect_server_region(interaction.client.session, place_id, job_id) or "Unknown"
 
         # 4) Only now use up one of their requests (the developer is never limited)
-        allowed, count, resets = check_and_increment_rate_limit(guild.id, interaction.user.id)
+        allowed, count, resets = check_and_increment_rate_limit(guild.id, interaction.user.id, limit)
         if not allowed:
-            return await interaction.followup.send(rate_limit_text(count, resets), ephemeral=True)
+            return await interaction.followup.send(rate_limit_text(count, resets, limit), ephemeral=True)
 
         raid_number = next_raid_number(guild.id)
-
-        viewer = guild.get_role(VIEWER_ROLE_ID) or guild.default_role
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            viewer: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_channels=True, attach_files=True),
-        }
-
-        try:
-            channel = await guild.create_text_channel(
-                name=ticket_channel_name(raid_number),
-                category=category,
-                overwrites=overwrites,
-                topic=f"requester:{interaction.user.id}|raid:{raid_number}",
-            )
-        except discord.Forbidden:
-            return await interaction.followup.send(
-                f"I'm missing permissions. Give {BOT_NAME} Manage Channels and try again.", ephemeral=True
-            )
+        setup_on = is_setup(guild.id)
+        # After /setup: Raid and Backup are numbered separately (Raid-ticket #1, Backup-ticket #1).
+        type_number = next_type_number(guild.id, self.request_type) if setup_on else None
 
         ticket = {
             "guild_id": guild.id,
             "raid_number": raid_number,
+            "type_number": type_number,
             "type": self.request_type,
             "requester_id": interaction.user.id,
             "roblox_username": roblox_name,
@@ -1364,10 +1530,39 @@ class RequestModal(discord.ui.Modal):
             "message_count": 0,
             "edit_btn": True,
         }
+
+        viewer = guild.get_role(VIEWER_ROLE_ID) or guild.default_role
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            viewer: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_channels=True, attach_files=True),
+        }
+
+        try:
+            channel = await guild.create_text_channel(
+                name=ticket_channel_name(ticket),
+                category=category,
+                overwrites=overwrites,
+                topic=f"requester:{interaction.user.id}|raid:{raid_number}",
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                f"I'm missing permissions. Give {BOT_NAME} Manage Channels and try again.", ephemeral=True
+            )
+
         save_ticket(channel.id, ticket)
 
         embed = build_ticket_embed(ticket)
-        ping = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else None
+
+        # Raid -> |Raid Ping|, Backup -> |Backup Ping| (after /setup). Old single ping role as a fallback.
+        ping = None
+        if setup_on:
+            ping_role = ping_role_for(guild, self.request_type)
+            if ping_role is not None:
+                ping = ping_role.mention
+        if ping is None and PING_ROLE_ID:
+            ping = f"<@&{PING_ROLE_ID}>"
         profile_url = roblox_profile_url(roblox_id)
 
         ticket_msg = await channel.send(
@@ -1382,13 +1577,18 @@ class RequestModal(discord.ui.Modal):
         await log_ticket_created(guild, ticket, ticket_msg.jump_url, profile_url)
 
         await interaction.followup.send(
-            view=DispatchView(self.request_type, raid_number, channel, count, resets), ephemeral=True
+            view=DispatchView(ticket, channel, count, resets, limit), ephemeral=True
         )
 
 
 def build_ticket_embed(ticket: dict) -> discord.Embed:
+    if ticket.get("type_number"):
+        title = ticket_label(ticket)  # "Raid-ticket #1" / "Backup-ticket #1"
+    else:
+        title = f"{ticket['type']} Ticket  #{ticket['raid_number']}"
+
     embed = discord.Embed(
-        title=f"{ticket['type']} Ticket  #{ticket['raid_number']}",
+        title=title,
         description=(
             f"<@{ticket['requester_id']}> ({roblox_display(ticket['roblox_username'], ticket['roblox_id'])}) "
             "will assist. Double-check all details before joining."
@@ -1782,7 +1982,7 @@ class RaidersView(discord.ui.View):
         lines = [helper_line(ticket, uid) for uid in ticket["helper_order"]]
 
         embed = discord.Embed(
-            title=f"{ticket['type']} #{ticket['raid_number']} Raiders - {len(lines)}",
+            title=f"{ticket_label(ticket)} Raiders - {len(lines)}",
             description="\n".join(lines),
             color=EMBED_COLOR,
         )
@@ -1796,10 +1996,18 @@ async def finalize_raid(bot_client: commands.Bot, guild: discord.Guild, channel:
 
     helper_ids = [int(uid) for uid in ticket["helper_order"]]
     if helper_ids:
+        is_raid = ticket["type"] == "Raid"
         add_raid_credit(
             guild.id, helper_ids,
             raid_number=ticket["raid_number"], result=ticket["result"], guild_name=guild.name,
+            is_raid=is_raid,
         )
+        # Tier roles are earned by assisting in RAIDS only (backups never count).
+        if is_raid:
+            try:
+                await award_tier_roles(guild, helper_ids)
+            except Exception as exc:
+                print(f"[{BOT_NAME}] Could not update Tier roles: {exc!r}")
 
     streak = update_win_streak(guild.id, ticket["result"])
     duration = format_duration(ticket["ended_at"] - ticket["started_at"])
@@ -1823,7 +2031,7 @@ async def finalize_raid(bot_client: commands.Bot, guild: discord.Guild, channel:
             description_lines.append(f"**Experience** - {ticket['experience']}")
 
         embed = discord.Embed(
-            title=f"{ticket['type']} - #{ticket['raid_number']} Result",
+            title=f"{ticket_label(ticket)} - Result",
             description="\n".join(description_lines),
             color=EMBED_COLOR,
         )
@@ -1861,7 +2069,7 @@ async def post_mvps(guild: discord.Guild, ticket: dict):
     mvp_ids = ticket["helper_order"][:3]
     mvp_lines = [helper_line(ticket, uid) for uid in mvp_ids]
 
-    embed = discord.Embed(title=f"MVPs  #{ticket['raid_number']}", description="\n".join(mvp_lines), color=EMBED_COLOR)
+    embed = discord.Embed(title=f"MVPs - {ticket_label(ticket)}", description="\n".join(mvp_lines), color=EMBED_COLOR)
     embed.set_footer(text="First to join this raid")
 
     await mvps_channel.send(
@@ -1885,7 +2093,7 @@ async def log_ticket_created(guild: discord.Guild, ticket: dict, ticket_jump_url
         return
 
     created_str = time.strftime("%A, %d %B %Y %H:%M", time.gmtime(ticket["started_at"]))
-    embed = discord.Embed(title=f"{ticket['type']} #{ticket['raid_number']} Ticket Created", color=EMBED_COLOR)
+    embed = discord.Embed(title=f"{ticket_label(ticket)} Created", color=EMBED_COLOR)
     embed.add_field(name="Opened By", value=f"<@{ticket['requester_id']}>", inline=True)
     embed.add_field(name="Created", value=created_str, inline=True)
     embed.add_field(name="Requester Roblox", value=ticket["roblox_username"], inline=False)
@@ -1910,7 +2118,7 @@ async def log_ticket_ended(guild: discord.Guild, ticket: dict):
 
     # Plain message only - no buttons/options.
     embed = discord.Embed(
-        description=f"Raid #{ticket['raid_number']} is completed. Check the results in the raid results channel.",
+        description=f"{ticket_label(ticket)} is completed. Check the results in the raid results channel.",
         color=EMBED_COLOR,
     )
     await logs_channel.send(embed=embed)
@@ -1922,7 +2130,7 @@ async def log_ticket_deleted(guild: discord.Guild, ticket: dict, deleted_by_id: 
         return
 
     embed = discord.Embed(
-        description=f"Ticket #{ticket['raid_number']} has been deleted by <@{deleted_by_id}>.",
+        description=f"{ticket_label(ticket)} has been deleted by <@{deleted_by_id}>.",
         color=EMBED_COLOR,
     )
     view = ReopenTicketView(channel_id)
@@ -2001,7 +2209,7 @@ class ReopenTicketView(discord.ui.View):
             overwrites[requester] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
         new_channel = await guild.create_text_channel(
-            name=ticket_channel_name(ticket["raid_number"]),
+            name=ticket_channel_name(ticket),
             category=category,
             overwrites=overwrites,
             topic=f"requester:{ticket['requester_id']}|raid:{ticket['raid_number']}",
@@ -2534,6 +2742,93 @@ async def nuke_command(interaction: discord.Interaction):
 
 
 # ======================================================
+# /setup  (admin) - turns on typed pings, Tier roles, Tier request limits and typed ticket names
+# ======================================================
+
+async def ensure_role(guild: discord.Guild, role_id: int, name: str, *, mentionable: bool, lines: list):
+    """Find the role (by id, then name) or create it. Returns the role or None."""
+    role = find_named_role(guild, role_id, name)
+    if role is not None:
+        note = "already exists"
+        if mentionable and not role.mentionable:
+            try:
+                await role.edit(mentionable=True, reason=f"{BOT_NAME} /setup")
+                note = "already exists (made mentionable)"
+            except (discord.Forbidden, discord.HTTPException):
+                note = "already exists (could NOT make it mentionable - give me Manage Roles)"
+        lines.append(f"{role.mention} - {note}")
+        return role
+    try:
+        role = await guild.create_role(name=name, mentionable=mentionable, reason=f"{BOT_NAME} /setup")
+        lines.append(f"{role.mention} - created")
+        return role
+    except (discord.Forbidden, discord.HTTPException):
+        lines.append(f"**{name}** - could not be created (give me Manage Roles)")
+        return None
+
+
+@bot.tree.command(name="setup", description="Set up ping roles, Tier roles, Tier request limits and Raid/Backup ticket names")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def setup_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    ping_lines: list = []
+    await ensure_role(guild, RAID_PING_ROLE_ID, RAID_PING_ROLE_NAME, mentionable=True, lines=ping_lines)
+    await ensure_role(guild, BACKUP_PING_ROLE_ID, BACKUP_PING_ROLE_NAME, mentionable=True, lines=ping_lines)
+
+    tier_lines: list = []
+    for tier in sorted(TIER_ROLE_IDS):
+        await ensure_role(guild, TIER_ROLE_IDS[tier], f"Tier-{tier}", mentionable=False, lines=tier_lines)
+
+    # switch the system on for this server
+    if guild.id not in DATA["setup_guilds"]:
+        DATA["setup_guilds"].append(guild.id)
+        save_data()
+
+    # hand out the Tier roles members have already earned from raids logged in this server
+    promoted = 0
+    for uid in list(DATA["stats"]["raid_assists"].get(str(guild.id), {})):
+        member = guild.get_member(int(uid))
+        if member is None:
+            continue
+        if await sync_tier_role(guild, member):
+            promoted += 1
+
+    embed = discord.Embed(title=f"{BOT_NAME} Setup Complete", color=EMBED_COLOR)
+    embed.add_field(name="Ping Roles", value="\n".join(ping_lines), inline=False)
+    embed.add_field(name="Tier Roles", value="\n".join(tier_lines), inline=False)
+
+    table = []
+    for tier in sorted(TIER_ROLE_IDS):
+        table.append(f"**Tier-{tier}** - {TIER_RAIDS_NEEDED[tier]}+ raids - {TIER_DAILY_LIMITS[tier]} requests / 24h")
+    table.append(f"No Tier role - {DAILY_REQUEST_LIMIT} requests / 24h")
+    embed.add_field(
+        name="Tiers (raids only, backups do not count)",
+        value="\n".join(table) + (f"\n\nRoles given to existing members now: **{promoted}**" if promoted else ""),
+        inline=False,
+    )
+
+    cookie_note = "" if ROBLOX_COOKIE else " (needs ROBLOX_COOKIE in your .env to work)"
+    embed.add_field(
+        name="Now Active",
+        value=(
+            "- A new **Raid** ticket pings |Raid Ping|, a new **Backup** ticket pings |Backup Ping|, together with the main embed\n"
+            "- Tickets are numbered separately: **Raid-ticket #1**, **Backup-ticket #1**\n"
+            f"- A helper who joined and is still offline on Roblox after {JOIN_WARNING_SECONDS // 60} minutes gets a reminder in the ticket{cookie_note}\n"
+            f"- After {TICKET_MESS_THRESHOLD} messages in a ticket: \"Ah, this is a real mess.\" with a Jump to Information button"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{BOT_NAME} - my highest role must be above the Tier roles so I can give them out")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ======================================================
 # /raid panel  and  /backup panel  (open the ticket-making process directly)
 # ======================================================
 
@@ -2806,11 +3101,14 @@ async def deauthorize_command(interaction: discord.Interaction):
         DATA["ticket_archive"][f"{key}:pre{stamp}"] = DATA["ticket_archive"].pop(key)
 
     DATA["authorized_guilds"] = [g for g in DATA["authorized_guilds"] if g != guild.id]
+    DATA["setup_guilds"] = [g for g in DATA["setup_guilds"] if g != guild.id]
     DATA["panel_messages"].pop(gid, None)
     DATA["leaderboard_messages"].pop(gid, None)
     DATA["raid_counters"].pop(gid, None)
+    DATA["type_counters"].pop(gid, None)
     DATA["stats"]["guilds"].pop(gid, None)
     DATA["stats"]["daily"].pop(gid, None)
+    DATA["stats"]["raid_assists"].pop(gid, None)
     DATA["request_limits"].pop(gid, None)
     DATA["win_streaks"].pop(gid, None)
     DATA["nuke_snapshots"].pop(gid, None)
@@ -2850,6 +3148,7 @@ async def overview_command(interaction: discord.Interaction):
     embed.add_field(name="Open Tickets", value=str(open_tickets), inline=True)
     embed.add_field(name="Total Raids Logged", value=str(total_raids), inline=True)
     embed.add_field(name="Total Assists (Server)", value=str(server_assists), inline=True)
+    embed.add_field(name="/setup Done", value="Yes" if is_setup(guild.id) else "No", inline=True)
     embed.set_footer(text=BOT_NAME)
 
     view = discord.ui.View(timeout=120)
@@ -4297,6 +4596,7 @@ bot.tree.add_command(role_group)
 async def on_member_remove(member: discord.Member):
     gid, uid = str(member.guild.id), str(member.id)
     DATA["stats"]["guilds"].get(gid, {}).pop(uid, None)
+    DATA["stats"]["raid_assists"].get(gid, {}).pop(uid, None)
     for day_stats in DATA["stats"]["daily"].get(gid, {}).values():
         day_stats.pop(uid, None)
     save_data()
@@ -4525,7 +4825,7 @@ async def view_command(interaction: discord.Interaction, member: discord.Member)
         t for t in DATA["ticket_archive"].values()
         if t.get("guild_id") == interaction.guild.id and t.get("requester_id") == member.id
     ]
-    tickets.sort(key=lambda t: t["raid_number"], reverse=True)
+    tickets.sort(key=lambda t: t.get("started_at", 0), reverse=True)
 
     raids = sum(1 for t in tickets if t["type"] == "Raid")
     backups = sum(1 for t in tickets if t["type"] == "Backup")
@@ -4552,6 +4852,14 @@ async def view_command(interaction: discord.Interaction, member: discord.Member)
         inline=True,
     )
 
+    tier = member_tier(member) if is_setup(interaction.guild.id) else None
+    if tier:
+        embed.add_field(
+            name="Tier",
+            value=f"Tier-{tier} ({get_raid_only_count(interaction.guild.id, member.id)} raid assists)",
+            inline=True,
+        )
+
     link = DATA["links"].get(str(member.id))
     if link:
         embed.add_field(
@@ -4572,7 +4880,7 @@ async def view_command(interaction: discord.Interaction, member: discord.Member)
         lines = []
         for t in tickets[:10]:
             result = t.get("result") or ("Open" if t["status"] == "open" else "No result")
-            lines.append(f"`#{t['raid_number']}` {t['type']} - {result} - <t:{t['started_at']}:d>")
+            lines.append(f"`{ticket_label(t)}` {t['type']} - {result} - <t:{t['started_at']}:d>")
         embed.add_field(name="Latest Tickets", value="\n".join(lines), inline=False)
     else:
         embed.description = "This member has not created any tickets here."
@@ -5227,7 +5535,7 @@ async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
     if not logs_channel:
         return
     embed = discord.Embed(
-        title=f"Offline Helper Warning - {ticket['type']} #{ticket['raid_number']}",
+        title=f"Offline Helper Warning - {ticket_label(ticket)}",
         description="These helpers joined this raid but were still not online when it ended:\n" + "\n".join(problems),
         color=0xED4245,
     )
@@ -5460,11 +5768,14 @@ async def whois_command(interaction: discord.Interaction, member: discord.Member
         tickets = [t for t in DATA["ticket_archive"].values() if t.get("guild_id") == guild.id and t.get("requester_id") == member.id]
         bl = DATA["blacklist"].get(str(member.id))
         bl_text = ("Yes - " + _clean(bl.get("reason", ""), 150)) if bl else "No"
+        tier = member_tier(member) if is_setup(guild.id) else None
+        tier_text = f"\n**Tier:** Tier-{tier} ({get_raid_only_count(guild.id, member.id)} raid assists)" if tier else ""
         d.add_field(
             name=BOT_NAME,
             value=(
                 f"**Assists (server):** {get_raid_count(guild.id, member.id, 'server')}\n"
-                f"**Assists (global):** {get_raid_count(guild.id, member.id, 'global')}\n"
+                f"**Assists (global):** {get_raid_count(guild.id, member.id, 'global')}"
+                f"{tier_text}\n"
                 f"**Tickets created:** {len(tickets)} "
                 f"({sum(1 for t in tickets if t['type'] == 'Raid')} raid, {sum(1 for t in tickets if t['type'] == 'Backup')} backup)\n"
                 f"**Blacklisted:** {bl_text}"
@@ -5673,6 +5984,13 @@ def merge_backup(incoming: dict) -> dict:
             if isinstance(count, int) and count > dst.get(uid, 0):
                 dst[uid] = count
 
+    # raid-only assists (the Tier roles are earned from these) - only ever raised, never lowered
+    for gid, users in ((incoming.get("stats") or {}).get("raid_assists") or {}).items():
+        dst = DATA["stats"]["raid_assists"].setdefault(gid, {})
+        for uid, count in (users or {}).items():
+            if isinstance(count, int) and count > dst.get(uid, 0):
+                dst[uid] = count
+
     for key, ticket in (incoming.get("ticket_archive") or {}).items():
         if key not in DATA["ticket_archive"]:
             DATA["ticket_archive"][key] = ticket
@@ -5689,6 +6007,17 @@ def merge_backup(incoming: dict) -> dict:
     for gid, count in (incoming.get("raid_counters") or {}).items():
         if isinstance(count, int) and count > DATA["raid_counters"].get(gid, 0):
             DATA["raid_counters"][gid] = count
+
+    # separate Raid / Backup ticket numbers - only ever raised
+    for gid, counters in (incoming.get("type_counters") or {}).items():
+        dst = DATA["type_counters"].setdefault(gid, {})
+        for kind, count in (counters or {}).items():
+            if isinstance(count, int) and count > dst.get(kind, 0):
+                dst[kind] = count
+
+    for gid in incoming.get("setup_guilds") or []:
+        if gid not in DATA["setup_guilds"]:
+            DATA["setup_guilds"].append(gid)
 
     for uid, entry in (incoming.get("blacklist") or {}).items():
         if uid not in DATA["blacklist"]:
