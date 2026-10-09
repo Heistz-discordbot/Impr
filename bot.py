@@ -14,21 +14,18 @@ Create Instant Invite (for /nuke-restore to recreate invites).
 For /setup and the Tier roles the bot's own role must sit ABOVE the Tier-1..Tier-5 roles
 (and above the ping roles) in Server Settings > Roles, and it needs Manage Roles.
 
-Data (raid numbers, ticket info, stats, panel/leaderboard message ids,
-rate limits, win streaks, saved configuration, the permanent ticket archive)
-is stored in cruxer_data.json next to this file, so it survives restarts.
-If you already have an imperium_data.json, the bot keeps using it (nothing is
-lost by the rename). Set CRUXER_DATA_FILE (or the old IMPERIUM_DATA_FILE) in
-your .env to store it somewhere else, for example a persistent volume on your
-host - if your host wipes files on every redeploy, you MUST do this or the
-global leaderboard will reset.
-
-GLOBAL LEADERBOARD HISTORY is now protected three ways:
-  1) a second file (cruxer_global.json, or CRUXER_GLOBAL_FILE) that holds only the global
-     totals + the full raid history and is merged back in on every start
-  2) it is rebuilt from the permanent ticket archive if the totals ever fall behind
-  3) the bot DMs the developer a backup file every 6 hours (and on start-up). If your host
-     wipes the disk, upload the latest one with /data-restore and nothing is lost.
+DATA SAFETY (nothing is ever reset):
+  * Everything is stored in cruxer_data.json. Set CRUXER_DATA_DIR in your .env to a PERSISTENT
+    folder / volume of your host. If your host wipes files on redeploy and you do not do this,
+    the only thing that saves you is the Discord backup below.
+  * Every save is atomic, keeps a .bak copy and up to 48 compressed snapshots (snapshots/ folder).
+  * On start the bot loads the main file, then the .bak, then the newest snapshots.
+  * Nothing is ever deleted: daily stats, the audit log, assists of members who left (they are
+    stashed and come back when the member rejoins) and everything of a /deauthorize'd server stay.
+  * A compressed backup is DMed to the developer every hour and after every finished raid
+    (also to CRUXER_BACKUP_CHANNEL_ID if you set it). If the bot ever starts with NO data file,
+    it finds the best backup it sent and restores it by itself. Manual: /data-restore.
+  * /data-status shows where the data lives and how safe it is.
 
 Roblox features (/hitlist, /see, /whois, /frnd, join checks, helper warnings,
 request verification, automatic server link + region) need ROBLOX_COOKIE in
@@ -38,70 +35,19 @@ WITHOUT a cookie, Raid/Backup requests still work: the member just pastes their
 server link and the in-game check is skipped.
 
 Optional .env values:
+  CRUXER_DATA_DIR                    - persistent folder for ALL data files (recommended)
+  CRUXER_DATA_FILE / CRUXER_GLOBAL_FILE - exact paths, if you want to override them
+  CRUXER_BACKUP_CHANNEL_ID           - a private channel that also receives the backups
   RALVORA_API_URL / RALVORA_API_KEY  - a region API to try first (see detect_server_region)
-  CRUXER_GLOBAL_FILE                 - where the extra global-leaderboard file lives
 
-Changes in this version (latest first):
-  - NEW /setup  (admin): turns on the new ticket system in the server it is run in:
-      * creates the roles |Raid Ping| and |Backup Ping| (and Tier-1..Tier-5) if they do not exist
-      * a new ticket pings |Raid Ping| for a Raid and |Backup Ping| for a Backup, together with
-        the main information embed
-      * Tier roles are given automatically for assisting in RAIDS only (backups do not count):
-        Tier-5 = 5 raids, Tier-4 = 25, Tier-3 = 50, Tier-2 = 75, Tier-1 = 100
-        (change TIER_RAIDS_NEEDED below if you want other numbers)
-      * the 24 hour request limit now depends on the Tier role:
-        Tier-1 = 10, Tier-2 = 7, Tier-3 = 5, Tier-4 = 3, Tier-5 = 3 (everyone else = 2)
-      * Raid and Backup tickets are numbered separately and named "Raid-ticket #1" /
-        "Backup-ticket #1" (the channel is raid-ticket-1 / backup-ticket-1 because Discord
-        forces channel names to lowercase without spaces)
-      * the helper offline reminder (5 minutes) and the "Ah, this is a real mess." notice (every
-        50 messages, with a Jump to Information button) are part of the system and stay on
-    Servers that never ran /setup keep working exactly as before.
-  - NEW /search  (admin): finds who used ANOTHER bot's commands recently (default: last 60
-    minutes). Discord stamps every slash-command reply with the person who ran it, so the bot
-    reads that, lists who ran what (with a jump link and a preview of what the other bot posted)
-    and pings them. Options: application (only that bot), channel, minutes, ping.
-  - NEW /trust add  and  /trust remove  (developer only): add or remove a member by user ID.
-    Trusted members can use the [OWN] commands. /trust, /data-backup and /data-restore stay
-    developer-only, and /deauthorize, ticket re-open and the bot-leave confirmation too.
-  - The developer alone is exempt from the 2 requests / 24 hours limit (nobody else is).
-  - FIX: Raid/Backup requests no longer fail with "Server verification is offline" when
-    ROBLOX_COOKIE is missing (or Roblox can't be reached). The pasted server link is used
-    instead and the live in-game check is skipped. With a working cookie nothing changes.
-  - .av [user]  (prefix command, also .avatar / .pfp): avatar + profile of a user
-  - /anti-nuke (was /antinuke) now records everything it locks / deletes / revokes, and
-    /nuke-restore puts the channels, locks and invites back
-  - /hitlist add is instant: runs every lookup in parallel, posts the alert straight away if
-    the target is already in a server, fills in the region afterwards, polls every 10s
-  - /bot stats can now show the stats of ANY server the bot is in (dropdown, paged) and still
-    remove the bot from any of them; shows missing permissions per server
-  - Old/legacy (embed) panels are removed automatically on every start and refresh
-  - /purge keeps only the newest working panel (or leaderboard) and deletes the older ones
-  - Global leaderboard history is permanent (see above); /data-backup and /data-restore
-  - /nuke -> "This guy thought he's him lol."
-  - /raid panel and /backup panel open the Raid / Backup ticket-making form directly
-  - Tickets have an Edit button (requester only) to change region, players, clan and server link
-  - After 50 messages in a ticket the bot posts "Ah, this is a real mess." with a
-    "Jump to Information" button (repeats every 50 further messages)
-  - Ticket info message is now tracked by id (the live duration timer no longer breaks in
-    busy tickets)
-  Earlier changes (all still included):
-  - Renamed Imperium -> Cruxer everywhere (old category/data file still recognised)
-  - Request limit is a 24 hour window that starts at the member's first request
-  - "Dispatched Successfully" info card after a request is created
-  - /frnd request, /see, /hitlist add profile, region auto-detect
-  - Atomic data file with .bak backup, corrupt file moved aside
-  - Requests need an existing Roblox profile AND a joinable game; verified join link stored
-  - One panel/leaderboard copy per channel, on_ready setup runs once
-  - #snipe channel for all hitlist/see alerts
-  - /whois, /sync, /add, /audit, /view, /link, /unlink, /blacklist, /role,
-    /tickets-export, /bot stats, /overview, /member-stats
-  - Helper offline warnings (in the ticket after 5 minutes, in #logs at the end)
-  - A member's SERVER stats reset when they leave that server (global never resets)
+Features: /setup (typed ping roles, Tier roles, Tier request limits, Raid-ticket #1 /
+Backup-ticket #1 names), /search, /trust add|remove, /anti-nuke + /nuke-restore, /hitlist,
+/see, /whois, /frnd, /link, /audit, /view, /purge, /bot stats, .av and more.
 """
 
 import asyncio
 import copy
+import gzip
 import hashlib
 import io
 import json
@@ -110,6 +56,7 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 import uuid
 import warnings
@@ -161,15 +108,23 @@ SUPPORT_SERVER_INVITE = None
 PREFIXES = (".", "!")  # ".av" works; "!sync" keeps working
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_NEW_DATA = os.path.join(_BASE_DIR, "cruxer_data.json")
-_OLD_DATA = os.path.join(_BASE_DIR, "imperium_data.json")
+DATA_DIR = os.getenv("CRUXER_DATA_DIR") or _BASE_DIR   # point this at a PERSISTENT folder/volume
+os.makedirs(DATA_DIR, exist_ok=True)
+_NEW_DATA = os.path.join(DATA_DIR, "cruxer_data.json")
+_OLD_DATA = os.path.join(DATA_DIR, "imperium_data.json")
 DATA_FILE = (
     os.getenv("CRUXER_DATA_FILE")
     or os.getenv("IMPERIUM_DATA_FILE")
     or (_OLD_DATA if os.path.exists(_OLD_DATA) and not os.path.exists(_NEW_DATA) else _NEW_DATA)
 )
 BACKUP_FILE = DATA_FILE + ".bak"
-GLOBAL_FILE = os.getenv("CRUXER_GLOBAL_FILE") or os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), "cruxer_global.json")
+_DATA_FOLDER = os.path.dirname(os.path.abspath(DATA_FILE))
+SNAPSHOT_DIR = os.path.join(_DATA_FOLDER, "snapshots")
+GLOBAL_FILE = os.getenv("CRUXER_GLOBAL_FILE") or os.path.join(_DATA_FOLDER, "cruxer_global.json")
+SNAPSHOT_KEEP = 48                 # compressed snapshots kept on disk
+SNAPSHOT_EVERY_SECONDS = 1800      # at most one snapshot per 30 minutes
+BACKUP_CHANNEL_ID = int(os.getenv("CRUXER_BACKUP_CHANNEL_ID") or 0)  # optional extra place for backups
+DATA_IS_PERSISTENT = bool(os.getenv("CRUXER_DATA_DIR") or os.getenv("CRUXER_DATA_FILE") or os.getenv("IMPERIUM_DATA_FILE"))
 
 LEADERBOARD_PAGE_SIZE = 10
 DURATION_UPDATE_SECONDS = 30
@@ -189,7 +144,7 @@ REQUIRE_LINK = False            # True = members must /link before they can requ
 
 TICKET_MESS_THRESHOLD = 50      # "Ah, this is a real mess." after this many messages (then every +50)
 MESS_PREFIX = "**Ah, this is a real mess.**"
-BACKUP_INTERVAL_HOURS = 6       # DM the developer a data backup this often
+BACKUP_INTERVAL_HOURS = 1       # DM the developer a data backup this often
 
 SEARCH_DEFAULT_MINUTES = 60     # /search looks this far back by default
 SEARCH_PER_CHANNEL_LIMIT = 500  # newest messages checked per channel by /search
@@ -222,28 +177,7 @@ TIER_DAILY_LIMITS = {1: 10, 2: 7, 3: 5, 4: 3, 5: 3}
 # DATA STORE
 # ======================================================
 
-def load_data():
-    data = None
-    for path in (DATA_FILE, BACKUP_FILE):
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if path == BACKUP_FILE:
-                print(f"[{BOT_NAME}] Main data file was unreadable - restored from the backup.")
-            break
-        except json.JSONDecodeError as exc:
-            print(f"[{BOT_NAME}] {path} is corrupt ({exc!r}). Moving it aside, NOT overwriting it.")
-            try:
-                os.replace(path, f"{path}.corrupt-{int(time.time())}")
-            except OSError:
-                pass
-        except OSError as exc:
-            raise SystemExit(f"[{BOT_NAME}] Cannot read {path}: {exc!r}. Refusing to start so no data is lost.")
-    if data is None:
-        data = {}
-
+def normalize_data(data: dict) -> dict:
     data.setdefault("raid_counters", {})
     data.setdefault("tickets", {})
     data.setdefault("stats", {"guilds": {}, "global": {}})
@@ -251,26 +185,89 @@ def load_data():
     data["stats"].setdefault("global", {})
     data["stats"].setdefault("daily", {})
     data["stats"].setdefault("raid_assists", {})  # RAID-only assists per server (drives the Tier roles)
-    data.setdefault("panel_messages", {})
-    data.setdefault("leaderboard_messages", {})
-    data.setdefault("authorized_guilds", [])
-    data.setdefault("request_limits", {})
-    data.setdefault("win_streaks", {})
-    data.setdefault("configs", {})
-    data.setdefault("trackers", {})
-    data.setdefault("blacklist", {})
-    data.setdefault("audit", [])
-    data.setdefault("links", {})
-    data.setdefault("pending_links", {})
-    data.setdefault("panel_channels", {})
-    data.setdefault("leaderboard_channels", {})
-    data.setdefault("ticket_archive", {})  # permanent copy of every ticket, never cleared
-    data.setdefault("global_history", [])  # permanent, append-only list of every finished raid
-    data.setdefault("nuke_snapshots", {})  # what /anti-nuke changed, so /nuke-restore can undo it
-    data.setdefault("trusted", {})  # members the developer trusted with the [OWN] commands (/trust add)
-    data.setdefault("setup_guilds", [])  # servers where /setup was run (typed pings, tiers, typed ticket names)
-    data.setdefault("type_counters", {})  # per server: separate ticket numbers for Raid and Backup
+    for key in ("panel_messages", "leaderboard_messages", "request_limits", "win_streaks", "configs",
+                "trackers", "blacklist", "links", "pending_links", "panel_channels", "leaderboard_channels",
+                "ticket_archive", "nuke_snapshots", "trusted", "type_counters",
+                "left_members", "archived_trackers"):
+        data.setdefault(key, {})
+    for key in ("authorized_guilds", "audit", "global_history", "setup_guilds"):
+        data.setdefault(key, [])
     return data
+
+
+def _list_snapshots():
+    try:
+        return sorted(
+            (os.path.join(SNAPSHOT_DIR, f) for f in os.listdir(SNAPSHOT_DIR) if f.endswith(".json.gz")),
+            reverse=True,  # newest first (names contain the timestamp)
+        )
+    except OSError:
+        return []
+
+
+def _read_data_file(path: str) -> dict:
+    with open(path, "rb") as f:
+        raw = f.read()
+    if not raw.strip():
+        raise ValueError("empty file")
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    return data
+
+
+_LOADED_FROM = None
+
+
+def load_data():
+    """Main file -> .bak -> newest snapshots. The first one that reads cleanly wins."""
+    global _LOADED_FROM
+    data = None
+    for path in [DATA_FILE, BACKUP_FILE] + _list_snapshots():
+        if not os.path.exists(path):
+            continue
+        try:
+            data = _read_data_file(path)
+            _LOADED_FROM = path
+            if path != DATA_FILE:
+                print(f"[{BOT_NAME}] Main data file was missing/unreadable - recovered from {path}")
+            break
+        except OSError as exc:
+            raise SystemExit(f"[{BOT_NAME}] Cannot read {path}: {exc!r}. Refusing to start so no data is lost.")
+        except Exception as exc:
+            print(f"[{BOT_NAME}] {path} is corrupt ({exc!r}).")
+            if path == DATA_FILE:
+                try:
+                    os.replace(path, f"{path}.corrupt-{int(time.time())}")  # moved aside, never overwritten
+                except OSError:
+                    pass
+    return normalize_data(data or {})
+
+
+_save_lock = threading.Lock()
+_last_snapshot_at = 0.0
+
+
+def _write_snapshot():
+    global _last_snapshot_at
+    now = time.time()
+    if now - _last_snapshot_at < SNAPSHOT_EVERY_SECONDS:
+        return
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        name = time.strftime("cruxer_%Y%m%d_%H%M%S", time.gmtime()) + ".json.gz"
+        with open(DATA_FILE, "rb") as src, gzip.open(os.path.join(SNAPSHOT_DIR, name), "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        _last_snapshot_at = now
+        for old in _list_snapshots()[SNAPSHOT_KEEP:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError as exc:
+        print(f"[{BOT_NAME}] Could not write a snapshot: {exc!r}")
 
 
 def _atomic_write_json(path: str, payload) -> None:
@@ -283,17 +280,23 @@ def _atomic_write_json(path: str, payload) -> None:
 
 
 def save_data():
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(DATA, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    if os.path.exists(DATA_FILE):
+    with _save_lock:
+        tmp = DATA_FILE + ".tmp"
         try:
-            shutil.copyfile(DATA_FILE, BACKUP_FILE)
-        except OSError:
-            pass
-    os.replace(tmp, DATA_FILE)  # atomic: the file is never half-written
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(DATA, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(DATA_FILE) and os.path.getsize(DATA_FILE) > 0:
+                try:
+                    shutil.copyfile(DATA_FILE, BACKUP_FILE)
+                except OSError:
+                    pass
+            os.replace(tmp, DATA_FILE)  # atomic: never half-written
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"[{BOT_NAME}] !!! SAVE FAILED: {exc!r}")
+            return
+        _write_snapshot()
 
 
 def save_global_file():
@@ -316,8 +319,13 @@ def _read_json(path: str):
         return None
 
 
-DATA_WAS_FRESH = not (os.path.exists(DATA_FILE) or os.path.exists(BACKUP_FILE))
 DATA = load_data()
+DATA_WAS_FRESH = _LOADED_FROM is None          # nothing at all on disk -> try the Discord backup on start
+if _LOADED_FROM not in (None, DATA_FILE):
+    save_data()                                # write the recovered data back to the main file
+if not DATA_IS_PERSISTENT:
+    print(f"[{BOT_NAME}] WARNING: CRUXER_DATA_DIR is not set. Data is stored in {DATA_FILE}. "
+          "If your host wipes files on redeploy, point CRUXER_DATA_DIR at a persistent volume.")
 BOT_START_TIME = int(time.time())
 
 
@@ -416,12 +424,8 @@ def add_raid_credit(guild_id: int, user_ids, raid_number=None, result=None, guil
     global_stats = DATA["stats"]["global"]
     raid_only = DATA["stats"]["raid_assists"].setdefault(gid, {})
 
-    # Daily stats: keep only today's bucket so the file does not grow forever.
-    today = today_str()
-    daily_for_guild = DATA["stats"]["daily"].setdefault(gid, {})
-    for old_day in [d for d in daily_for_guild if d != today]:
-        daily_for_guild.pop(old_day, None)
-    daily_stats = daily_for_guild.setdefault(today, {})
+    # Daily stats: every day is kept forever (the daily leaderboard just shows today's bucket).
+    daily_stats = DATA["stats"]["daily"].setdefault(gid, {}).setdefault(today_str(), {})
 
     for uid in user_ids:
         uid = str(uid)
@@ -937,8 +941,6 @@ async def create_or_update_readme(guild: discord.Guild, authorized: bool):
             )
 
             # Keep exactly ONE #read-me channel in this guild.
-            # Delete every other channel with the same name, regardless of its topic,
-            # so old/duplicate Cruxer read-me channels cannot accumulate.
             if existing:
                 for duplicate in channels:
                     if duplicate.id == existing.id:
@@ -1086,14 +1088,11 @@ async def geolocate_ip(session: aiohttp.ClientSession, ip: str):
 async def detect_server_region(session: aiohttp.ClientSession, place_id, job_id):
     """Best-effort region for a live Roblox server. Returns text like "Ashburn, Virginia, US" or None.
 
-    1) RALVORA_API_URL (if you set one in .env) is tried first. I could not find public docs for
-       a "Ralvora" API, so the request/response shape below is a guess: GET ?placeId=..&jobId=..
-       and the first of region / server_region / location / country in the JSON is used.
-       Edit _try_ralvora() once you have the real docs.
+    1) RALVORA_API_URL (if you set one in .env) is tried first. The request/response shape is a
+       guess: GET ?placeId=..&jobId=.. and the first of region / server_region / location /
+       country in the JSON is used. Edit _try_ralvora() once you have the real docs.
     2) Fallback that needs nothing extra: ask Roblox's gamejoin endpoint (with the bot's cookie)
-       for the server's datacenter IP and geolocate that IP. This is the same trick Roblox server
-       region browser extensions use. It is approximate - Roblox datacenter IPs do not always
-       map to the exact city.
+       for the server's datacenter IP and geolocate that IP. Approximate.
     """
     if not place_id or not job_id:
         return None
@@ -2060,6 +2059,9 @@ async def finalize_raid(bot_client: commands.Bot, guild: discord.Guild, channel:
 
     await channel.send("This raid has been recorded.", view=DeleteTicketView(channel.id))
 
+    # Back the data up the moment a raid is recorded.
+    spawn(send_backup_to_dev(reason=f"{ticket_label(ticket)} finished"))
+
 
 async def post_mvps(guild: discord.Guild, ticket: dict):
     mvps_channel = guild.get_channel(MVPS_CHANNEL_ID) or discord.utils.get(guild.text_channels, name=MVPS_CHANNEL_NAME)
@@ -2567,6 +2569,19 @@ class CruxerTree(app_commands.CommandTree):
         await super().on_error(interaction, error)
 
 
+def register_ticket_views():
+    """Re-attach the buttons of every stored ticket (used on start and after an automatic restore)."""
+    for channel_id_str, ticket in DATA["tickets"].items():
+        channel_id = int(channel_id_str)
+        profile_url = roblox_profile_url(ticket.get("roblox_id"))
+        if ticket["status"] == "open":
+            bot.add_view(TicketView(channel_id, profile_url))
+        elif ticket["status"] == "ended":
+            bot.add_view(DeleteTicketView(channel_id))
+        elif ticket["status"] == "deleted":
+            bot.add_view(ReopenTicketView(channel_id))
+
+
 class CruxerBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -2580,17 +2595,7 @@ class CruxerBot(commands.Bot):
 
         self.add_view(PanelView())
         self.add_view(LeaderboardView())
-
-        for channel_id_str, ticket in DATA["tickets"].items():
-            channel_id = int(channel_id_str)
-            profile_url = roblox_profile_url(ticket.get("roblox_id"))
-
-            if ticket["status"] == "open":
-                self.add_view(TicketView(channel_id, profile_url))
-            elif ticket["status"] == "ended":
-                self.add_view(DeleteTicketView(channel_id))
-            elif ticket["status"] == "deleted":
-                self.add_view(ReopenTicketView(channel_id))
+        register_ticket_views()
 
         # Slash commands are synced per server in on_ready (see sync_guild_commands).
 
@@ -2600,6 +2605,11 @@ class CruxerBot(commands.Bot):
         backup_loop.start()
 
     async def close(self):
+        try:
+            save_data()
+            save_global_file()
+        except Exception as exc:
+            print(f"[{BOT_NAME}] Final save failed: {exc!r}")
         if self.session:
             await self.session.close()
         await super().close()
@@ -2626,7 +2636,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 @tasks.loop(seconds=DURATION_UPDATE_SECONDS)
 async def duration_updater():
-    now = int(time.time())
     for channel_id_str, ticket in list(DATA["tickets"].items()):
         if ticket["status"] != "open":
             continue
@@ -3075,7 +3084,7 @@ async def authorize_command(interaction: discord.Interaction):
 @bot.tree.command(name="deauthorize", description="[OWN] Remove Cruxer's setup from this server and leave")
 @app_commands.guild_only()
 async def deauthorize_command(interaction: discord.Interaction):
-    # Developer only - this deletes channels and server data and makes the bot leave.
+    # Developer only - this deletes the bot's channels and makes the bot leave (stored data is KEPT).
     if interaction.user.id != DEVELOPER_ID:
         return await interaction.response.send_message(f"Only the {BOT_NAME} developer can use /deauthorize.", ephemeral=True)
 
@@ -3094,27 +3103,23 @@ async def deauthorize_command(interaction: discord.Interaction):
 
     gid = str(guild.id)
 
-    # Raid numbers restart after a re-authorize, so keep this server's archived tickets under a unique key
-    # (otherwise new "#1" tickets would overwrite the old "#1" in the permanent archive).
-    stamp = int(time.time())
-    for key in [k for k, v in DATA["ticket_archive"].items() if v.get("guild_id") == guild.id and ":pre" not in k]:
-        DATA["ticket_archive"][f"{key}:pre{stamp}"] = DATA["ticket_archive"].pop(key)
-
+    # Nothing is wiped any more: counters, assists, daily stats, limits, win streak, tickets and the archive stay,
+    # so authorizing this server again just carries on where it stopped.
     DATA["authorized_guilds"] = [g for g in DATA["authorized_guilds"] if g != guild.id]
-    DATA["setup_guilds"] = [g for g in DATA["setup_guilds"] if g != guild.id]
-    DATA["panel_messages"].pop(gid, None)
-    DATA["leaderboard_messages"].pop(gid, None)
-    DATA["raid_counters"].pop(gid, None)
-    DATA["type_counters"].pop(gid, None)
-    DATA["stats"]["guilds"].pop(gid, None)
-    DATA["stats"]["daily"].pop(gid, None)
-    DATA["stats"]["raid_assists"].pop(gid, None)
-    DATA["request_limits"].pop(gid, None)
-    DATA["win_streaks"].pop(gid, None)
-    DATA["nuke_snapshots"].pop(gid, None)
-    DATA["trackers"] = {k: t for k, t in DATA["trackers"].items() if t.get("guild_id") != guild.id}
-    # NOTE: DATA["stats"]["global"], DATA["global_history"] and DATA["ticket_archive"] are intentionally never wiped here.
-    DATA["tickets"] = {cid: t for cid, t in DATA["tickets"].items() if t.get("guild_id") != guild.id}
+    for key in ("panel_messages", "leaderboard_messages", "panel_channels", "leaderboard_channels"):
+        DATA[key].pop(gid, None)  # only stale message/channel ids (those channels were just deleted)
+
+    moved = {k: t for k, t in DATA["trackers"].items() if t.get("guild_id") == guild.id}
+    for k in moved:
+        DATA["trackers"].pop(k, None)
+    if moved:
+        DATA["archived_trackers"].setdefault(gid, {}).update(moved)
+
+    for cid, t in list(DATA["tickets"].items()):
+        if t.get("guild_id") == guild.id and t["status"] == "open":
+            t["status"] = "deleted"
+            t["deleted_by"] = interaction.user.id
+            save_ticket(int(cid), t)
     save_data()
     save_global_file()
 
@@ -3775,7 +3780,7 @@ async def require_admin(interaction: discord.Interaction) -> bool:
 
 async def require_owner(interaction: discord.Interaction, dev_only: bool = False) -> bool:
     """The [OWN] commands: the developer, plus members added with /trust add.
-    dev_only=True keeps a command for the developer alone (used by /trust, /data-backup, /data-restore)."""
+    dev_only=True keeps a command for the developer alone (used by /trust, /data-backup, /data-restore, /data-status)."""
     allowed = interaction.user.id == DEVELOPER_ID if dev_only else can_use_own(interaction.user.id)
     if allowed:
         return True
@@ -4588,18 +4593,45 @@ bot.tree.add_command(role_group)
 
 
 # ======================================================
-# STATS RESET WHEN A MEMBER LEAVES A SERVER
+# MEMBERS LEAVING / REJOINING
+# Nothing is deleted: a leaving member's server stats are stashed and come back when they rejoin.
 # (global leaderboard totals are never touched)
 # ======================================================
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     gid, uid = str(member.guild.id), str(member.id)
-    DATA["stats"]["guilds"].get(gid, {}).pop(uid, None)
-    DATA["stats"]["raid_assists"].get(gid, {}).pop(uid, None)
-    for day_stats in DATA["stats"]["daily"].get(gid, {}).values():
-        day_stats.pop(uid, None)
+    server = DATA["stats"]["guilds"].get(gid, {}).pop(uid, 0)
+    raids = DATA["stats"]["raid_assists"].get(gid, {}).pop(uid, 0)
+    daily = {}
+    for day, day_stats in DATA["stats"]["daily"].get(gid, {}).items():
+        if uid in day_stats:
+            daily[day] = day_stats.pop(uid)
+    if server or raids or daily:
+        DATA["left_members"].setdefault(gid, {})[uid] = {
+            "server": server, "raids": raids, "daily": daily, "left_at": int(time.time()),
+        }
     save_data()
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    gid, uid = str(member.guild.id), str(member.id)
+    saved = DATA["left_members"].get(gid, {}).pop(uid, None)
+    if not saved:
+        return
+    g = DATA["stats"]["guilds"].setdefault(gid, {})
+    g[uid] = g.get(uid, 0) + saved.get("server", 0)
+    r = DATA["stats"]["raid_assists"].setdefault(gid, {})
+    r[uid] = r.get(uid, 0) + saved.get("raids", 0)
+    for day, count in (saved.get("daily") or {}).items():
+        d = DATA["stats"]["daily"].setdefault(gid, {}).setdefault(day, {})
+        d[uid] = d.get(uid, 0) + count
+    save_data()
+    try:
+        await sync_tier_role(member.guild, member)
+    except Exception:
+        pass
 
 
 # ======================================================
@@ -4691,14 +4723,13 @@ async def add_command(interaction: discord.Interaction, item: app_commands.Choic
 
 
 # ======================================================
-# AUDIT LOG  (/audit)
+# AUDIT LOG  (/audit) - entries are kept forever
 # ======================================================
 
 def log_audit(action: str, guild_id: int, by: int, **fields):
     entry = {"ts": int(time.time()), "action": action, "guild_id": guild_id, "by": by}
     entry.update(fields)
     DATA["audit"].append(entry)
-    del DATA["audit"][:-1000]  # keep the newest 1000
     save_data()
 
 
@@ -4892,16 +4923,13 @@ async def view_command(interaction: discord.Interaction, member: discord.Member)
 # ======================================================
 # /search  (admin) - who used ANOTHER bot's command recently, and what did they run?
 #
-# How it works: when a bot answers a slash command, Discord stamps that reply with the
-# person who ran it (message.interaction_metadata). Cruxer reads the recent messages of
-# the other bot(s), lists who ran what, and pings them.
+# Discord stamps every slash-command reply with the person who ran it
+# (message.interaction_metadata). Cruxer reads the recent messages of the other bot(s),
+# lists who ran what, and pings them.
 # Limits (Discord's, not Cruxer's):
-#   - the typed arguments (the text given to /say) are not stored by Discord. You see the
-#     command name and what the bot POSTED, which is exactly the offending message.
-#   - messages a bot posts on its own with channel.send (not as a command reply) and prefix
-#     commands (!say) carry no stamp. For a prefix command Cruxer falls back to the message
-#     the bot replied to, when there is one.
-#   - ephemeral replies cannot be read by anyone but the person who ran the command.
+#   - typed arguments are not stored by Discord; you see the command name and what the bot POSTED
+#   - messages a bot posts on its own and ephemeral replies carry no stamp
+#   - for prefix commands Cruxer falls back to the message the bot replied to
 # ======================================================
 
 def message_preview(msg: discord.Message, limit: int = 160) -> str:
@@ -5546,7 +5574,7 @@ async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
 # ======================================================
 # /see  (instant lookup)
 #   not in a game        -> says he is not in a server
-#   in game, joins on    -> everything: game, join link, region, full profile (also posted in #snipe)
+#   in game, joins on    -> everything: game, join link, region, full profile
 #   in game, joins off   -> the game he is playing + basic info only
 # ======================================================
 
@@ -5917,41 +5945,112 @@ async def tickets_export_command(interaction: discord.Interaction, all_servers: 
 
 
 # ======================================================
-# DATA BACKUP / RESTORE  (keeps the global leaderboard history safe, even if the host wipes the disk)
+# DATA BACKUP / RESTORE  (keeps everything safe, even if the host wipes the disk)
 # ======================================================
 
 _last_backup_hash: str | None = None
+_restore_checked = False   # backups are not sent until the start-up restore check has finished
 
 
-def data_payload() -> bytes:
-    return json.dumps(DATA, indent=2).encode("utf-8")
+def decode_backup(raw: bytes) -> dict:
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    return data
+
+
+async def backup_targets():
+    targets = []
+    try:
+        dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
+        targets.append(dev.dm_channel or await dev.create_dm())
+    except discord.HTTPException:
+        pass
+    if BACKUP_CHANNEL_ID:
+        try:
+            targets.append(bot.get_channel(BACKUP_CHANNEL_ID) or await bot.fetch_channel(BACKUP_CHANNEL_ID))
+        except discord.HTTPException:
+            pass
+    return targets
 
 
 async def send_backup_to_dev(force: bool = False, reason: str = "Scheduled backup") -> str:
-    """DM the developer the full data file. Skips when nothing changed since the last backup (unless forced)."""
+    """Send a compressed full backup to your DM (and CRUXER_BACKUP_CHANNEL_ID). Skips if nothing changed."""
     global _last_backup_hash
-    payload = data_payload()
-    digest = hashlib.sha256(payload).hexdigest()
+    if not _restore_checked:
+        return "waiting"  # never let a fresh/empty file bury your real backups
+    raw = json.dumps(DATA, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
     if not force and digest == _last_backup_hash:
         return "unchanged"
+    payload = gzip.compress(raw, 6)
     if len(payload) > 9_500_000:
-        print(f"[{BOT_NAME}] Backup file is {len(payload)} bytes - too big to DM. Use /tickets-export or copy the file by hand.")
+        print(f"[{BOT_NAME}] Backup is {len(payload)} bytes - too big to send. Copy the data folder by hand.")
         return "too_big"
-    try:
-        dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
-        stamp = time.strftime("%Y-%m-%d_%H%M", time.gmtime())
-        await dev.send(
-            f"**{BOT_NAME} data backup** - {reason}\n"
-            f"Global leaderboard members: `{len(DATA['stats']['global']):,}` | raids in history: `{len(DATA['global_history']):,}` | "
-            f"archived tickets: `{len(DATA['ticket_archive']):,}`\n"
-            "-# If the host ever wipes the bot's files, upload this file with /data-restore.",
-            file=discord.File(io.BytesIO(payload), filename=f"cruxer_backup_{stamp}.json"),
-        )
+
+    stamp = time.strftime("%Y-%m-%d_%H%M", time.gmtime())
+    text = (
+        f"**{BOT_NAME} data backup** - {reason}\n"
+        f"Global leaderboard members: `{len(DATA['stats']['global']):,}` | raids in history: `{len(DATA['global_history']):,}` | "
+        f"archived tickets: `{len(DATA['ticket_archive']):,}`\n"
+        "-# If the bot ever starts with no data, it restores the newest of these by itself. Manual: /data-restore."
+    )
+    sent = False
+    for target in await backup_targets():
+        try:
+            await target.send(text, file=discord.File(io.BytesIO(payload), filename=f"cruxer_backup_{stamp}.json.gz"))
+            sent = True
+        except discord.HTTPException as exc:
+            print(f"[{BOT_NAME}] Could not send the backup to {target}: {exc}")
+    if sent:
         _last_backup_hash = digest
         return "sent"
-    except discord.HTTPException as exc:
-        print(f"[{BOT_NAME}] Could not DM the backup to the developer (are your DMs open?): {exc}")
-        return "failed"
+    return "failed"
+
+
+def _backup_score(d: dict) -> int:
+    try:
+        return (len(d.get("ticket_archive") or {}) * 1000
+                + sum((d.get("stats") or {}).get("global", {}).values())
+                + len(d.get("global_history") or []))
+    except Exception:
+        return 0
+
+
+async def auto_restore_from_discord():
+    """Fresh start with no data file: find the BEST backup the bot ever sent and load it. Returns its filename or None."""
+    best, best_score, best_name = None, -1, None
+    for source in await backup_targets():
+        checked = 0
+        try:
+            async for msg in source.history(limit=150):
+                if msg.author.id != bot.user.id:
+                    continue
+                for att in msg.attachments:
+                    if not att.filename.startswith("cruxer_backup_") or att.size > 25 * 1024 * 1024:
+                        continue
+                    try:
+                        candidate = decode_backup(await att.read())
+                    except Exception:
+                        continue
+                    checked += 1
+                    score = _backup_score(candidate)
+                    if score > best_score:
+                        best, best_score, best_name = candidate, score, att.filename
+                if checked >= 15:
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    if best is None:
+        return None
+    DATA.clear()
+    DATA.update(normalize_data(best))
+    save_data()
+    merge_global_sources()
+    register_ticket_views()
+    return best_name
 
 
 @tasks.loop(hours=BACKUP_INTERVAL_HOURS)
@@ -5991,6 +6090,14 @@ def merge_backup(incoming: dict) -> dict:
             if isinstance(count, int) and count > dst.get(uid, 0):
                 dst[uid] = count
 
+    # daily stats: every day is kept, only ever raised
+    for gid, days in ((incoming.get("stats") or {}).get("daily") or {}).items():
+        for day, users in (days or {}).items():
+            dst = DATA["stats"]["daily"].setdefault(gid, {}).setdefault(day, {})
+            for uid, count in (users or {}).items():
+                if isinstance(count, int) and count > dst.get(uid, 0):
+                    dst[uid] = count
+
     for key, ticket in (incoming.get("ticket_archive") or {}).items():
         if key not in DATA["ticket_archive"]:
             DATA["ticket_archive"][key] = ticket
@@ -6003,6 +6110,14 @@ def merge_backup(incoming: dict) -> dict:
             DATA["global_history"].append(h)
             known.add(k)
             added["history"] += 1
+
+    known_audit = {(a.get("ts"), a.get("action"), a.get("by")) for a in DATA["audit"]}
+    for a in incoming.get("audit") or []:
+        k = (a.get("ts"), a.get("action"), a.get("by"))
+        if k not in known_audit:
+            DATA["audit"].append(a)
+            known_audit.add(k)
+    DATA["audit"].sort(key=lambda a: a.get("ts", 0))
 
     for gid, count in (incoming.get("raid_counters") or {}).items():
         if isinstance(count, int) and count > DATA["raid_counters"].get(gid, 0):
@@ -6018,6 +6133,11 @@ def merge_backup(incoming: dict) -> dict:
     for gid in incoming.get("setup_guilds") or []:
         if gid not in DATA["setup_guilds"]:
             DATA["setup_guilds"].append(gid)
+
+    for gid, members in (incoming.get("left_members") or {}).items():
+        dst = DATA["left_members"].setdefault(gid, {})
+        for uid, saved in (members or {}).items():
+            dst.setdefault(uid, saved)
 
     for uid, entry in (incoming.get("blacklist") or {}).items():
         if uid not in DATA["blacklist"]:
@@ -6050,13 +6170,14 @@ async def data_backup_command(interaction: discord.Interaction):
     texts = {
         "sent": "Backup sent to your DMs.",
         "failed": "I could not DM you. Open your DMs for server members and try again.",
-        "too_big": "The data file is too big to DM. Copy cruxer_data.json from the host instead.",
+        "too_big": "The data file is too big to send. Copy the data folder from the host instead.",
+        "waiting": "The bot is still starting up. Try again in a few seconds.",
     }
     await interaction.followup.send(texts.get(result, "Done."), ephemeral=True)
 
 
 @bot.tree.command(name="data-restore", description="[OWN] Merge a Cruxer backup file back in (never lowers any count)")
-@app_commands.describe(file="A cruxer_backup_*.json / cruxer_data.json / cruxer_tickets.json file")
+@app_commands.describe(file="A cruxer_backup_*.json(.gz) / cruxer_data.json / cruxer_tickets.json file")
 @app_commands.guild_only()
 async def data_restore_command(interaction: discord.Interaction, file: discord.Attachment):
     if not await require_owner(interaction, dev_only=True):
@@ -6066,13 +6187,12 @@ async def data_restore_command(interaction: discord.Interaction, file: discord.A
 
     await interaction.response.defer(ephemeral=True)
     try:
-        incoming = json.loads((await file.read()).decode("utf-8"))
-        if not isinstance(incoming, dict):
-            raise ValueError("not a JSON object")
+        incoming = decode_backup(await file.read())
     except Exception as exc:
         return await interaction.followup.send(f"That is not a valid backup file ({exc!r}).", ephemeral=True)
 
     added = merge_backup(incoming)
+    register_ticket_views()
     await interaction.followup.send(
         "Backup merged. Nothing was deleted or lowered.\n"
         f"- Leaderboard members raised/added: `{added['leaderboard_users']}`\n"
@@ -6083,6 +6203,33 @@ async def data_restore_command(interaction: discord.Interaction, file: discord.A
         f"Global leaderboard now has `{len(DATA['stats']['global']):,}` members.",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="data-status", description="[OWN] Where Cruxer saves its data and how safe it is")
+@app_commands.guild_only()
+async def data_status_command(interaction: discord.Interaction):
+    if not await require_owner(interaction, dev_only=True):
+        return
+    size = os.path.getsize(DATA_FILE) if os.path.exists(DATA_FILE) else 0
+    snaps = _list_snapshots()
+    embed = discord.Embed(title=f"{BOT_NAME} Data Status", color=EMBED_COLOR)
+    embed.add_field(name="Data file", value=f"`{DATA_FILE}`\n{size / 1024:,.1f} KB", inline=False)
+    embed.add_field(name="Persistent folder set", value="Yes" if DATA_IS_PERSISTENT else "**No** - set CRUXER_DATA_DIR", inline=True)
+    embed.add_field(name="Snapshots", value=f"{len(snaps)} (newest: `{os.path.basename(snaps[0]) if snaps else 'none'}`)", inline=True)
+    embed.add_field(
+        name="Backups to Discord",
+        value="DM" + (" + backup channel" if BACKUP_CHANNEL_ID else "") + f", every {BACKUP_INTERVAL_HOURS}h and after each raid",
+        inline=False,
+    )
+    embed.add_field(
+        name="Stored",
+        value=(
+            f"Leaderboard members: `{len(DATA['stats']['global']):,}`\nRaid history: `{len(DATA['global_history']):,}`\n"
+            f"Archived tickets: `{len(DATA['ticket_archive']):,}`\nAudit entries: `{len(DATA['audit']):,}`"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ======================================================
@@ -6103,7 +6250,7 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
-    # No farewell messages, DMs, or farewell channels.
+    # No farewell messages, DMs, or farewell channels. Stored data is kept.
     print(f"Removed from server: {guild.name} ({guild.id})")
 
 
@@ -6112,7 +6259,7 @@ _ready_done = False
 
 @bot.event
 async def on_ready():
-    global _commands_synced, _ready_done
+    global _commands_synced, _ready_done, _restore_checked
 
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Connected to {len(bot.guilds)} server(s). Global leaderboard entries loaded: {len(DATA['stats']['global'])}")
@@ -6125,17 +6272,28 @@ async def on_ready():
     cookie_ok, cookie_text = await roblox_cookie_status(bot.session)
     print(f"[{BOT_NAME}] Roblox account check: {'OK' if cookie_ok else 'PROBLEM'} - {cookie_text}")
 
-    if DATA_WAS_FRESH and bot.guilds:
-        # The data file did not exist at start-up: either the very first run, or the host wiped the disk.
-        try:
-            dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
-            await dev.send(
-                f"**{BOT_NAME} started with NO data file.** If this is not the very first run, your host wiped the disk. "
-                "Upload your latest `cruxer_backup_*.json` with **/data-restore** and the global leaderboard history comes back. "
-                "To stop it happening, set CRUXER_DATA_FILE in your .env to a persistent folder."
-            )
-        except discord.HTTPException:
-            pass
+    # No data file at start-up: either the very first run, or the host wiped the disk.
+    # Look for the newest/best backup the bot sent to Discord and restore it automatically.
+    try:
+        if DATA_WAS_FRESH:
+            restored = None
+            try:
+                restored = await auto_restore_from_discord()
+            except Exception as exc:
+                print(f"[{BOT_NAME}] Auto-restore failed: {exc!r}")
+            try:
+                dev = bot.get_user(DEVELOPER_ID) or await bot.fetch_user(DEVELOPER_ID)
+                if restored:
+                    await dev.send(f"**{BOT_NAME} started with no data file and restored everything automatically** from `{restored}`.")
+                elif bot.guilds:
+                    await dev.send(
+                        f"**{BOT_NAME} started with NO data file and found no backup.** If this is not the very first run, "
+                        "upload your latest backup with **/data-restore** and set CRUXER_DATA_DIR to a persistent folder."
+                    )
+            except discord.HTTPException:
+                pass
+    finally:
+        _restore_checked = True
 
     if not _commands_synced:
         _commands_synced = True
