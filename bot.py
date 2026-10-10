@@ -27,10 +27,11 @@ DATA SAFETY (nothing is ever reset):
     it finds the best backup it sent and restores it by itself. Manual: /data-restore.
   * /data-status shows where the data lives and how safe it is.
 
-Roblox features (/hitlist, /see, /whois, /frnd, join checks, helper warnings,
-request verification, automatic server link + region) need ROBLOX_COOKIE in
-your .env - the .ROBLOSECURITY cookie of a Roblox account (use a spare/alt
-account, never your main). Roblox's presence API refuses anonymous requests.
+Roblox presence features (/hitlist, /snipe, /whois, /frnd, join checks, helper
+warnings, request verification and automatic server-link detection) require
+ROBLOX_COOKIE in .env. ROBLOX_API_KEY alone is not a substitute for the cookie.
+Use a dedicated Roblox alt account for the cookie, never your main account.
+Region detection is best-effort and may return Unknown if Roblox hides server data.
 WITHOUT a cookie, Raid/Backup requests still work: the member just pastes their
 server link and the in-game check is skipped.
 
@@ -38,11 +39,11 @@ Optional .env values:
   CRUXER_DATA_DIR                    - persistent folder for ALL data files (recommended)
   CRUXER_DATA_FILE / CRUXER_GLOBAL_FILE - exact paths, if you want to override them
   CRUXER_BACKUP_CHANNEL_ID           - a private channel that also receives the backups
-  RALVORA_API_URL / RALVORA_API_KEY  - a region API to try first (see detect_server_region)
+  RALVORA_API_URL + RALVORA_API_KEY (or ROBLOX_API_KEY) - optional region API; URL is still required
 
 Features: /setup (typed ping roles, Tier roles, Tier request limits, Raid-ticket #1 /
 Backup-ticket #1 names), /search, /trust add|remove, /anti-nuke + /nuke-restore, /hitlist,
-/see, /whois, /frnd, /link, /audit, /view, /purge, /bot stats, .av and more.
+/snipe, /whois, /frnd, /link, /audit, /view, /purge, /bot stats, .av and more.
 """
 
 import asyncio
@@ -134,7 +135,7 @@ ANTINUKE_WINDOW_SECONDS = 600  # look back 10 minutes for recent activity
 
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")
 RALVORA_API_URL = os.getenv("RALVORA_API_URL")
-RALVORA_API_KEY = os.getenv("RALVORA_API_KEY")
+RALVORA_API_KEY = os.getenv("RALVORA_API_KEY") or os.getenv("ROBLOX_API_KEY")
 TRACKER_POLL_SECONDS = 10
 MAX_TRACKED_PER_GUILD = 25
 OWN = "[OWN] "
@@ -1323,7 +1324,8 @@ def is_roblox_url(link: str) -> bool:
 def parse_roblox_link(link: str):
     """Returns (place_id, job_id) found inside a Roblox link; either may be None."""
     place = re.search(r"placeId=(\d+)", link) or re.search(r"roblox\.com/(?:[a-z\-]+/)?games/(\d+)", link, re.I)
-    job = re.search(r"gameInstanceId=([0-9a-fA-F\-]{8,})", link)
+    job = (re.search(r"(?:gameInstanceId|serverInstanceId|gameId)=([0-9a-fA-F\-]{8,})", link, re.I)
+           or re.search(r"privateServerLinkCode=([0-9]+)", link, re.I))
     return (place.group(1) if place else None, job.group(1) if job else None)
 
 
@@ -1400,15 +1402,19 @@ class RequestModal(discord.ui.Modal):
         self.request_type = request_type
 
         # Linked members are never asked for a server link: it is read from the server they are in.
-        self.auto_link = bool(DATA["links"].get(str(user_id))) and bool(ROBLOX_COOKIE)
+        self.auto_link = bool(ROBLOX_COOKIE)
 
-        self.region = discord.ui.TextInput(
-            label="Server region (empty = auto-detect)",
-            default=DATA["configs"].get(str(user_id), {}).get("region") or None,
-            placeholder="e.g. NA, EU, AS, OCE - or leave empty",
-            required=False,
-            max_length=30,
-        )
+        # If authenticated presence is available, try to detect the region automatically.
+        # Without a Roblox cookie, keep the manual region field as a fallback.
+        self.region = None
+        if not ROBLOX_COOKIE:
+            self.region = discord.ui.TextInput(
+                label="Server region (empty = auto-detect)",
+                default=DATA["configs"].get(str(user_id), {}).get("region") or None,
+                placeholder="e.g. NA, EU, AS, OCE - or leave empty",
+                required=False,
+                max_length=30,
+            )
         self.reported_players = discord.ui.TextInput(
             label="Reported players / details",
             style=discord.TextStyle.paragraph,
@@ -1418,7 +1424,8 @@ class RequestModal(discord.ui.Modal):
         saved_username = saved_roblox_name(user_id)
         self.username = discord.ui.TextInput(label="Your Roblox username", default=saved_username, max_length=40)
 
-        self.add_item(self.region)
+        if self.region is not None:
+            self.add_item(self.region)
         self.add_item(self.reported_players)
 
         self.clan = None
@@ -1487,7 +1494,7 @@ class RequestModal(discord.ui.Modal):
         link = verified_link  # store the verified live join link (or the pasted link as a fallback)
 
         # 3) Region: use what they typed, otherwise detect it from the live server
-        region = self.region.value.strip()
+        region = self.region.value.strip() if self.region is not None else ""
         if not region:
             place_id, job_id = parse_roblox_link(link)
             region = await detect_server_region(interaction.client.session, place_id, job_id) or "Unknown"
@@ -1659,7 +1666,7 @@ class EditRequestModal(discord.ui.Modal, title="Edit Request"):
 
         region_default = ticket["region"] if ticket.get("region") not in (None, "Unknown") else None
         self.region = discord.ui.TextInput(
-            label="Server region (empty = auto-detect)",
+            label="Server region (leave empty to auto-detect)",
             default=region_default[:30] if region_default else None,
             required=False,
             max_length=30,
@@ -5252,7 +5259,7 @@ async def unlink_command(interaction: discord.Interaction):
 
 
 # ======================================================
-# ROBLOX HELPERS (join check, /see, /whois, /frnd)
+# ROBLOX HELPERS (join check, /snipe, /whois, /frnd)
 # ======================================================
 
 PRESENCE_NAMES = {0: "Offline", 1: "Online (not in a game)", 2: "In a game", 3: "In Roblox Studio"}
@@ -5315,7 +5322,7 @@ def _clean(text: str, limit: int) -> str:
 
 
 async def build_roblox_embed(session: aiohttp.ClientSession, roblox_id: int, roblox_name: str) -> discord.Embed:
-    """The whole Roblox profile (used by /whois, /see and /hitlist add)."""
+    """The whole Roblox profile (used by /whois, /snipe and /hitlist add)."""
     user_json, friends, followers, followings, history, groups, avatar, presences = await asyncio.gather(
         roblox_json(session, f"https://users.roblox.com/v1/users/{roblox_id}"),
         roblox_json(session, f"https://friends.roblox.com/v1/users/{roblox_id}/friends/count"),
@@ -5572,13 +5579,13 @@ async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
 
 
 # ======================================================
-# /see  (instant lookup)
+# /snipe  (instant lookup)
 #   not in a game        -> says he is not in a server
 #   in game, joins on    -> everything: game, join link, region, full profile
 #   in game, joins off   -> the game he is playing + basic info only
 # ======================================================
 
-@bot.tree.command(name="see", description="Find out if a Roblox player is in a server right now (full info when their joins are on)")
+@bot.tree.command(name="snipe", description="Find out if a Roblox player is in a server right now (full info when their joins are on)")
 @app_commands.describe(username="Roblox username to look up")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -5590,7 +5597,7 @@ async def see_command(interaction: discord.Interaction, username: str):
     session = interaction.client.session
     if session is None:
         return await interaction.followup.send(
-            "Roblox lookup is still starting up. Try /see again in a few seconds.",
+            "Roblox lookup is still starting up. Try /snipe again in a few seconds.",
             ephemeral=True,
         )
 
@@ -5610,7 +5617,7 @@ async def see_command(interaction: discord.Interaction, username: str):
         if presences is None:
             return await interaction.followup.send(
                 "Roblox did not return a presence result after a few attempts. "
-                "Try `/see` again in a moment. If this keeps happening, check ROBLOX_COOKIE.",
+                "Try `/snipe` again in a moment. If this keeps happening, check ROBLOX_COOKIE.",
                 ephemeral=True,
             )
 
@@ -5696,19 +5703,19 @@ async def see_command(interaction: discord.Interaction, username: str):
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         print(f"[{BOT_NAME}] /see Roblox request failed for {typed_username}: {exc}")
         return await interaction.followup.send(
-            "The Roblox lookup timed out. Please try `/see` again in a moment.",
+            "The Roblox lookup timed out. Please try `/snipe` again in a moment.",
             ephemeral=True,
         )
     except discord.HTTPException as exc:
         print(f"[{BOT_NAME}] /see Discord response failed: {exc}")
         return await interaction.followup.send(
-            "I found the player, but Discord could not send the result. Please try `/see` again.",
+            "I found the player, but Discord could not send the result. Please try `/snipe` again.",
             ephemeral=True,
         )
     except Exception as exc:
         print(f"[{BOT_NAME}] /see unexpected error for {typed_username}: {exc!r}")
         return await interaction.followup.send(
-            "Something went wrong while checking that player. Please try `/see` again.",
+            "Something went wrong while checking that player. Please try `/snipe` again.",
             ephemeral=True,
         )
 
