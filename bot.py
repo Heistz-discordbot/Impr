@@ -3802,8 +3802,14 @@ async def require_admin(interaction: discord.Interaction) -> bool:
 # SERVER RECOVERY: bulk unban + recruit
 # ======================================================
 
-@bot.tree.command(
-    name="bulk-unban",
+# This creates the requested slash-command path: /bulk unban
+bulk_group = app_commands.Group(
+    name="bulk",
+    description="Server recovery tools",
+)
+
+@bulk_group.command(
+    name="unban",
     description="Unban members banned by a specified bot during a time window",
 )
 @app_commands.describe(
@@ -3902,12 +3908,16 @@ async def bulk_unban_command(
             failed.append((user_id, str(exc)[:120]))
 
     if unbanned_ids:
+        # Normalize old queue entries to strings before deduplicating.
         queue = DATA["recruit_queue"].setdefault(str(guild.id), [])
+        queue = [str(uid) for uid in queue if str(uid).isdigit()]
         known = set(queue)
         for user_id in unbanned_ids:
-            if str(user_id) not in known:
-                queue.append(str(user_id))
-                known.add(str(user_id))
+            uid = str(user_id)
+            if uid not in known:
+                queue.append(uid)
+                known.add(uid)
+        DATA["recruit_queue"][str(guild.id)] = queue
         save_data()
 
     embed = discord.Embed(
@@ -3930,6 +3940,10 @@ async def bulk_unban_command(
         )
     embed.set_footer(text="Only bans attributed to the specified bot in Discord's audit log were considered.")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# Register the /bulk group exactly once so Discord exposes /bulk unban.
+bot.tree.add_command(bulk_group)
 
 
 @bot.tree.command(
@@ -3959,18 +3973,29 @@ async def recruit_command(interaction: discord.Interaction):
     failed = []
     remaining = []
 
+    # Process a snapshot so queue edits during this run cannot skip entries.
     for raw_id in list(queue):
+        uid = str(raw_id).strip()
         try:
-            user = bot.get_user(int(raw_id))
+            if not uid.isdigit():
+                failed.append(uid or "(invalid ID)")
+                remaining.append(uid)
+                continue
+            user = bot.get_user(int(uid))
             if user is None:
-                user = await bot.fetch_user(int(raw_id))
+                user = await bot.fetch_user(int(uid))
             await user.send(message)
             sent += 1
-            # Small delay helps avoid bursts of DM requests / rate limits.
-            await asyncio.sleep(0.7)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
-            failed.append(str(raw_id))
-            remaining.append(str(raw_id))
+            await asyncio.sleep(0.8)  # gently pace DMs to reduce rate-limit bursts
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError) as exc:
+            print(f"[{BOT_NAME}] Recruit DM failed for {uid}: {exc}")
+            failed.append(uid)
+            remaining.append(uid)
+        except Exception as exc:
+            # One unexpected failure must not stop recruitment for everyone else.
+            print(f"[{BOT_NAME}] Unexpected recruit failure for {uid}: {exc!r}")
+            failed.append(uid)
+            remaining.append(uid)
 
     DATA["recruit_queue"][str(guild.id)] = remaining
     save_data()
