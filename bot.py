@@ -40,6 +40,8 @@ Optional .env values:
   CRUXER_DATA_FILE / CRUXER_GLOBAL_FILE - exact paths, if you want to override them
   CRUXER_BACKUP_CHANNEL_ID           - a private channel that also receives the backups
   RALVORA_API_URL + RALVORA_API_KEY (or ROBLOX_API_KEY) - optional region API; URL is still required
+  Note: Fishstrap is a local Roblox launcher, not a remote-player lookup API. Ralvora
+  region lookup only works if you have a valid API endpoint/key and its documented response.
 
 Features: /setup (typed ping roles, Tier roles, Tier request limits, Raid-ticket #1 /
 Backup-ticket #1 names), /search, /trust add|remove, /anti-nuke + /nuke-restore, /hitlist,
@@ -924,82 +926,93 @@ def spawn(coro):
 # ======================================================
 
 async def create_or_update_readme(guild: discord.Guild, authorized: bool):
-    """Create/update exactly one #read-me channel per guild and remove duplicates."""
+    """Maintain one read-me channel and one current Cruxer read-me message per guild."""
     lock = _readme_locks.setdefault(guild.id, asyncio.Lock())
     async with lock:
         try:
+            # Re-check Discord's current channel cache while holding the per-guild lock.
             channels = [
                 c for c in guild.text_channels
-                if c.name.lower() == README_CHANNEL_NAME
+                if c.name.casefold() == README_CHANNEL_NAME.casefold()
             ]
-
+            topic = f"Information about {BOT_NAME}".casefold()
             existing = next(
-                (
-                    c for c in channels
-                    if (c.topic or "").lower() == f"information about {BOT_NAME}".lower()
-                ),
+                (c for c in channels if (c.topic or "").casefold() == topic),
                 channels[0] if channels else None,
             )
 
-            # Keep exactly ONE #read-me channel in this guild.
-            if existing:
-                for duplicate in channels:
-                    if duplicate.id == existing.id:
-                        continue
-                    try:
-                        await duplicate.delete(
-                            reason=f"{BOT_NAME}: keep exactly one read-me channel"
-                        )
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
+            # Prefer one channel and remove every duplicate we can manage.
+            for duplicate in channels:
+                if existing is not None and duplicate.id == existing.id:
+                    continue
+                try:
+                    await duplicate.delete(reason=f"{BOT_NAME}: remove duplicate read-me channel")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
 
             embed = build_readme_embed(guild, authorized)
             view = discord.ui.View(timeout=None)
             if SUPPORT_SERVER_INVITE:
-                view.add_item(
-                    discord.ui.Button(
-                        label="Support Server",
-                        style=discord.ButtonStyle.link,
-                        url=SUPPORT_SERVER_INVITE,
-                    )
-                )
-            view.add_item(
-                discord.ui.Button(
-                    label="Open Developer Profile",
+                view.add_item(discord.ui.Button(
+                    label="Support Server",
                     style=discord.ButtonStyle.link,
-                    url=f"https://discord.com/users/{DEVELOPER_ID}",
+                    url=SUPPORT_SERVER_INVITE,
+                ))
+            view.add_item(discord.ui.Button(
+                label="Open Developer Profile",
+                style=discord.ButtonStyle.link,
+                url=f"https://discord.com/users/{DEVELOPER_ID}",
+            ))
+
+            if existing is None:
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(
+                        view_channel=True, send_messages=False, read_message_history=True
+                    ),
+                    guild.me: discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True, embed_links=True, manage_channels=True
+                    ),
+                }
+                # Final cache check avoids creating a second channel if another setup path
+                # created it while this call was waiting on Discord.
+                existing = next(
+                    (c for c in guild.text_channels
+                     if c.name.casefold() == README_CHANNEL_NAME.casefold()),
+                    None,
                 )
-            )
+                if existing is None:
+                    existing = await guild.create_text_channel(
+                        name=README_CHANNEL_NAME,
+                        overwrites=overwrites,
+                        topic=f"Information about {BOT_NAME}",
+                        reason=f"{BOT_NAME} Read-me channel",
+                    )
 
-            if existing:
-                async for msg in existing.history(limit=20):
-                    if msg.author == guild.me and msg.embeds:
-                        await msg.edit(embed=embed, view=view)
-                        return existing
+            # Edit one existing bot-authored read-me message; remove duplicate bot
+            # read-me embeds so repeated join/setup calls cannot accumulate messages.
+            keeper = None
+            async for msg in existing.history(limit=100):
+                if msg.author != bot.user:
+                    continue
+                is_readme_message = bool(msg.embeds) and any(
+                    (e.title or "").casefold() == BOT_NAME.casefold()
+                    for e in msg.embeds
+                )
+                if not is_readme_message:
+                    continue
+                if keeper is None:
+                    keeper = msg
+                else:
+                    try:
+                        await msg.delete()
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+            if keeper:
+                await keeper.edit(embed=embed, view=view)
+            else:
                 await existing.send(embed=embed, view=view)
-                return existing
-
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=False,
-                    read_message_history=True,
-                ),
-                guild.me: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    embed_links=True,
-                    manage_channels=True,
-                ),
-            }
-            channel = await guild.create_text_channel(
-                name=README_CHANNEL_NAME,
-                overwrites=overwrites,
-                topic=f"Information about {BOT_NAME}",
-                reason=f"{BOT_NAME} Read-me channel",
-            )
-            await channel.send(embed=embed, view=view)
-            return channel
+            return existing
 
         except discord.Forbidden:
             return None
