@@ -9,7 +9,7 @@ the Discord Developer Portal (Bot tab).
 
 The bot also needs these server permissions to use every feature below:
 Manage Channels, Manage Roles, Manage Webhooks, Manage Guild (for invites),
-Kick Members, View Audit Log, Embed Links, Attach Files, Read Message History,
+Kick Members, Ban Members, View Audit Log, Embed Links, Attach Files, Read Message History,
 Create Instant Invite (for /nuke-restore to recreate invites).
 For /setup and the Tier roles the bot's own role must sit ABOVE the Tier-1..Tier-5 roles
 (and above the ping roles) in Server Settings > Roles, and it needs Manage Roles.
@@ -191,7 +191,7 @@ def normalize_data(data: dict) -> dict:
     for key in ("panel_messages", "leaderboard_messages", "request_limits", "win_streaks", "configs",
                 "trackers", "blacklist", "links", "pending_links", "panel_channels", "leaderboard_channels",
                 "ticket_archive", "nuke_snapshots", "trusted", "type_counters",
-                "left_members", "archived_trackers"):
+                "left_members", "archived_trackers", "recruit_queue"):
         data.setdefault(key, {})
     for key in ("authorized_guilds", "audit", "global_history", "setup_guilds"):
         data.setdefault(key, [])
@@ -3796,6 +3796,191 @@ async def require_admin(interaction: discord.Interaction) -> bool:
         return True
     await interaction.response.send_message("Administrator permission required.", ephemeral=True)
     return False
+
+
+# ======================================================
+# SERVER RECOVERY: bulk unban + recruit
+# ======================================================
+
+@bot.tree.command(
+    name="bulk-unban",
+    description="Unban members banned by a specified bot during a time window",
+)
+@app_commands.describe(
+    bot_id="Discord user ID of the bot that performed the bans",
+    hours="How far back to check (1-720 hours; Discord audit logs have limited retention)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def bulk_unban_command(
+    interaction: discord.Interaction,
+    bot_id: str,
+    hours: app_commands.Range[int, 1, 720] = 24,
+):
+    if not await require_admin(interaction):
+        return
+    guild = interaction.guild
+    try:
+        executor_id = int(bot_id.strip())
+        if executor_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return await interaction.response.send_message(
+            "Enter the numeric Discord user ID of the bot that made the bans.",
+            ephemeral=True,
+        )
+
+    me = guild.me
+    if me is None or not me.guild_permissions.ban_members or not me.guild_permissions.view_audit_log:
+        return await interaction.response.send_message(
+            "I need **Ban Members** and **View Audit Log** permissions to do this.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=int(hours))
+    targets = set()
+    audit_entries = 0
+
+    try:
+        async for entry in guild.audit_logs(
+            limit=None,
+            after=cutoff,
+            action=discord.AuditLogAction.ban,
+        ):
+            audit_entries += 1
+            executor = getattr(entry, "user", None)
+            target = getattr(entry, "target", None)
+            if (
+                executor is not None
+                and executor.id == executor_id
+                and target is not None
+                and getattr(target, "id", None) is not None
+            ):
+                targets.add(int(target.id))
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "Discord denied access to the audit log. Check my **View Audit Log** permission.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as exc:
+        return await interaction.followup.send(
+            f"Could not read the audit log: {exc}",
+            ephemeral=True,
+        )
+
+    if not targets:
+        return await interaction.followup.send(
+            f"No ban audit entries by bot ID `{executor_id}` were found in the last **{hours} hour(s)**. "
+            "Check the ID and time window; Discord may no longer retain older audit entries.",
+            ephemeral=True,
+        )
+
+    currently_banned = {}
+    try:
+        async for ban_entry in guild.bans(limit=None):
+            if ban_entry.user.id in targets:
+                currently_banned[ban_entry.user.id] = ban_entry.user
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "Discord denied access to the ban list. Check my **Ban Members** permission.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as exc:
+        return await interaction.followup.send(f"Could not read the ban list: {exc}", ephemeral=True)
+
+    unbanned_ids = []
+    failed = []
+    for user_id, user in currently_banned.items():
+        try:
+            await guild.unban(
+                user,
+                reason=f"Server recovery: ban was made by bot {executor_id} within {hours} hour(s)",
+            )
+            unbanned_ids.append(user_id)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            failed.append((user_id, str(exc)[:120]))
+
+    if unbanned_ids:
+        queue = DATA["recruit_queue"].setdefault(str(guild.id), [])
+        known = set(queue)
+        for user_id in unbanned_ids:
+            if str(user_id) not in known:
+                queue.append(str(user_id))
+                known.add(str(user_id))
+        save_data()
+
+    embed = discord.Embed(
+        title="Bulk Unban — Server Recovery",
+        description=(
+            f"**Banned by bot:** `{executor_id}`\n"
+            f"**Time window:** Last {hours} hour(s)\n"
+            f"**Matching ban records:** {len(targets)}\n"
+            f"**Currently banned and unbanned:** {len(unbanned_ids)}\n"
+            f"**Failed:** {len(failed)}\n\n"
+            "Successfully unbanned users were added to the `/recruit` queue."
+        ),
+        color=EMBED_COLOR,
+    )
+    if failed:
+        embed.add_field(
+            name="Failed user IDs",
+            value=", ".join(f"`{uid}`" for uid, _ in failed[:15]),
+            inline=False,
+        )
+    embed.set_footer(text="Only bans attributed to the specified bot in Discord's audit log were considered.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="recruit",
+    description="DM users successfully unbanned by /bulk-unban with the server invite",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def recruit_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    queue = DATA["recruit_queue"].get(str(guild.id), [])
+    if not queue:
+        return await interaction.response.send_message(
+            "There are no users queued for recruitment. Run `/bulk-unban` first.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    message = (
+        f"Hey! You are unbanned now, and we'd love to have you back. "
+        f"Please join Rq again: https://discord.gg/C2QhW9Q6SK"
+    )
+    sent = 0
+    failed = []
+    remaining = []
+
+    for raw_id in list(queue):
+        try:
+            user = bot.get_user(int(raw_id))
+            if user is None:
+                user = await bot.fetch_user(int(raw_id))
+            await user.send(message)
+            sent += 1
+            # Small delay helps avoid bursts of DM requests / rate limits.
+            await asyncio.sleep(0.7)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+            failed.append(str(raw_id))
+            remaining.append(str(raw_id))
+
+    DATA["recruit_queue"][str(guild.id)] = remaining
+    save_data()
+    await interaction.followup.send(
+        f"**Recruitment complete.**\n"
+        f"DMs sent: **{sent}**\n"
+        f"DMs not delivered (kept in queue for retry): **{len(failed)}**\n"
+        "Some users may have DMs disabled or may have blocked the bot.",
+        ephemeral=True,
+    )
 
 
 async def require_owner(interaction: discord.Interaction, dev_only: bool = False) -> bool:
