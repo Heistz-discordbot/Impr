@@ -130,7 +130,6 @@ BACKUP_CHANNEL_ID = int(os.getenv("CRUXER_BACKUP_CHANNEL_ID") or 0)  # optional 
 DATA_IS_PERSISTENT = bool(os.getenv("CRUXER_DATA_DIR") or os.getenv("CRUXER_DATA_FILE") or os.getenv("IMPERIUM_DATA_FILE"))
 
 LEADERBOARD_PAGE_SIZE = 10
-DURATION_UPDATE_SECONDS = 30
 DAILY_REQUEST_LIMIT = 2  # members without a Tier role
 RATE_WINDOW_SECONDS = 24 * 60 * 60  # window starts at the member's first request
 ANTINUKE_WINDOW_SECONDS = 600  # look back 10 minutes for recent activity
@@ -141,13 +140,21 @@ RALVORA_API_KEY = os.getenv("RALVORA_API_KEY") or os.getenv("ROBLOX_API_KEY")
 TRACKER_POLL_SECONDS = 10
 MAX_TRACKED_PER_GUILD = 25
 OWN = "[OWN] "
-JOIN_WARNING_SECONDS = 300      # warn if a helper is still offline this long after joining
-JOIN_CHECK_POLL_SECONDS = 30
+JOIN_WARNING_SECONDS = 180      # first warning if a helper is still offline 3 minutes after joining
+JOIN_FINAL_WARNING_SECONDS = 600  # final warning at 10 minutes still offline
+JOIN_CHECK_POLL_SECONDS = 20
 REQUIRE_LINK = False            # True = members must /link before they can request
 
-TICKET_MESS_THRESHOLD = 50      # "Ah, this is a real mess." after this many messages (then every +50)
-MESS_PREFIX = "**Ah, this is a real mess.**"
+TICKET_MESS_THRESHOLD = 50      # busy-ticket notice after this many messages (then every +50)
+MESS_PREFIX = "**Ticket is getting busy.**"
+MESS_MESSAGES = [
+    "**Ticket is getting busy.**\nThis channel has a lot of messages. Use the button below to jump back to the request information.",
+    "**Heads up — high activity.**\nThere are many messages here. Jump to the ticket information so nothing important is missed.",
+    "**Busy ticket notice.**\nActivity is high in this channel. Return to the request details with the button below.",
+]
 BACKUP_INTERVAL_HOURS = 1       # DM the developer a data backup this often
+DURATION_UPDATE_SECONDS = 15   # keep the live timer updating more frequently
+WARNINGS_CHANNEL_NAME = "warnings"
 
 SEARCH_DEFAULT_MINUTES = 60     # /search looks this far back by default
 SEARCH_PER_CHANNEL_LIMIT = 500  # newest messages checked per channel by /search
@@ -1024,15 +1031,15 @@ async def create_or_update_readme(guild: discord.Guild, authorized: bool):
 def build_readme_embed(guild: discord.Guild, authorized: bool) -> discord.Embed:
     if authorized:
         description = (
-            f"Thank you for authorizing {BOT_NAME} in {guild.name}.\n\n"
+            f"Thank you for authorizing {BOT_NAME} in **{guild.name}**.\n\n"
             f"{BOT_NAME} is a raid coordination bot. It lets members request a raid "
             "or backup, opens a private ticket for the request, tracks who joins, "
             "and records the result once the raid is over.\n\n"
-            f"For questions or support, contact the developer: <@{DEVELOPER_ID}>."
+            f"For questions or support, contact the developer."
         )
     else:
         description = (
-            f"Hello. Thank you for inviting me to {guild.name}.\n\n"
+            f"Hello. Thank you for inviting me to **{guild.name}**.\n\n"
             "This is a premium bot and this server is currently unauthorized.\n\n"
             "To authorize your server, please join the support server and "
             "contact the developer to get access.\n\n"
@@ -1269,7 +1276,8 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
             discord.ui.TextDisplay(
                 "## What is this ❓\n"
                 "- This is a backup panel. This is where you can **request** for **raids**, simply asking "
-                "for help when getting teamed on especially in The Strongest Battlegrounds for now. "
+                "for help when getting teamed on especially in "
+                "[**The Strongest Battlegrounds**](https://www.roblox.com/games/10418864827/The-Strongest-Battlegrounds) for now. "
                 "We will expand to different games soon.\n"
                 "- Simply choose **Raid** or **Backup** from the menu below and move further."
             ),
@@ -1804,6 +1812,7 @@ class JoinRobloxModal(discord.ui.Modal, title="Join Raid"):
             "joined_at": int(time.time()),
             "seen_online": False,
             "warned": False,
+            "final_warned": False,
         }
         if uid not in ticket["helper_order"]:
             ticket["helper_order"].append(uid)
@@ -1817,11 +1826,12 @@ class JoinRobloxModal(discord.ui.Modal, title="Join Raid"):
 
         await refresh_ticket_message(channel, ticket)
 
-        # Only a redirect to the member's Roblox profile - no username/bio text.
+        # Give the helper a direct Join Server button + Roblox profile link.
+        join_view = discord.ui.View(timeout=None)
+        if ticket.get("server_link"):
+            join_view.add_item(discord.ui.Button(label="Join Server", style=discord.ButtonStyle.link, url=ticket["server_link"]))
         profile_url = roblox_profile_url(roblox_id)
-        join_view = None
         if profile_url:
-            join_view = discord.ui.View(timeout=None)
             join_view.add_item(discord.ui.Button(label="Roblox Profile", style=discord.ButtonStyle.link, url=profile_url))
         await channel.send(f"<@{interaction.user.id}> joined the raid.", view=join_view)
 
@@ -2696,11 +2706,10 @@ async def ticket_busy_watcher(message: discord.Message):
             url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{info_id}"
             view = discord.ui.View(timeout=None)
             view.add_item(discord.ui.Button(label="Jump to Information", style=discord.ButtonStyle.link, url=url))
+        msg_text = MESS_MESSAGES[(n // TICKET_MESS_THRESHOLD - 1) % len(MESS_MESSAGES)]
+        msg_text += f"\n-# {n} messages in this ticket."
         try:
-            await message.channel.send(
-                f"{MESS_PREFIX}\n-# {n} messages in this ticket now. Jump back to the request information below.",
-                view=view,
-            )
+            await message.channel.send(msg_text, view=view)
         except discord.HTTPException:
             pass
         save_ticket(message.channel.id, ticket)
@@ -3948,11 +3957,14 @@ bot.tree.add_command(bulk_group)
 
 @bot.tree.command(
     name="recruit",
-    description="DM users successfully unbanned by /bulk-unban with the server invite",
+    description="[DISABLED] Previously DM'd unbanned users with the server invite",
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def recruit_command(interaction: discord.Interaction):
+    return await interaction.response.send_message(
+        "This command has been removed.", ephemeral=True
+    )
     if not await require_admin(interaction):
         return
 
@@ -4819,7 +4831,7 @@ async def role_remove(interaction: discord.Interaction, member: discord.Member, 
     await interaction.followup.send(f"Removed {role.mention} from {member.mention}.", allowed_mentions=discord.AllowedMentions.none())
 
 
-bot.tree.add_command(role_group)
+# bot.tree.add_command(role_group)  # removed per request: /role add|remove
 
 
 # ======================================================
@@ -5697,8 +5709,16 @@ class JoinCheckView(BlacklistGate, discord.ui.LayoutView):
 
 
 # ======================================================
-# HELPER WATCHER (offline 5 minutes after joining -> warning)
+# HELPER WATCHER (offline 3 min = first warning, 10 min = final warning)
 # ======================================================
+
+async def get_warnings_channel(guild: discord.Guild):
+    """Prefer a dedicated #warnings channel (created by /setup). Fallback to logs."""
+    ch = discord.utils.get(guild.text_channels, name=WARNINGS_CHANNEL_NAME)
+    if isinstance(ch, discord.TextChannel):
+        return ch
+    return await get_logs_channel(guild)
+
 
 @tasks.loop(seconds=JOIN_CHECK_POLL_SECONDS)
 async def join_watch_loop():
@@ -5734,23 +5754,70 @@ async def join_watch_loop():
             h["seen_online"] = True
             changed.add(cid)
             continue
-        if not h.get("warned") and now - h.get("joined_at", now) >= JOIN_WARNING_SECONDS:
+
+        elapsed = now - h.get("joined_at", now)
+        channel = bot.get_channel(int(cid))
+        guild = channel.guild if channel else None
+
+        # First warning at 3 minutes
+        if not h.get("warned") and elapsed >= JOIN_WARNING_SECONDS:
             h["warned"] = True
             changed.add(cid)
-            channel = bot.get_channel(int(cid))
-            if channel is None:
-                continue
-            view = discord.ui.View(timeout=None)
-            view.add_item(discord.ui.Button(label="Open Server", style=discord.ButtonStyle.link, url=ticket["server_link"]))
-            try:
-                await channel.send(
-                    f"Warning: <@{uid}> joined this {ticket['type'].lower()} over {JOIN_WARNING_SECONDS // 60} minutes ago, "
-                    f"but their Roblox account **{h['username']}** still shows **Offline**. Please join the server now.",
-                    view=view,
-                    allowed_mentions=discord.AllowedMentions(users=True),
-                )
-            except discord.HTTPException:
-                pass
+            if channel:
+                view = discord.ui.View(timeout=None)
+                if ticket.get("server_link"):
+                    view.add_item(discord.ui.Button(label="Join Server", style=discord.ButtonStyle.link, url=ticket["server_link"]))
+                try:
+                    await channel.send(
+                        f"⚠️ **First warning:** <@{uid}> joined this {ticket['type'].lower()} "
+                        f"**{JOIN_WARNING_SECONDS // 60} minutes** ago, but their Roblox account "
+                        f"**{h['username']}** is still **Offline**. Please join the server now.",
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                except discord.HTTPException:
+                    pass
+                if guild:
+                    warn_ch = await get_warnings_channel(guild)
+                    if warn_ch and warn_ch.id != channel.id:
+                        try:
+                            await warn_ch.send(
+                                f"⚠️ First offline warning in {channel.mention}: <@{uid}> "
+                                f"({h['username']}) still Offline after {JOIN_WARNING_SECONDS // 60}m.",
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        except discord.HTTPException:
+                            pass
+
+        # Final warning at 10 minutes
+        if h.get("warned") and not h.get("final_warned") and elapsed >= JOIN_FINAL_WARNING_SECONDS:
+            h["final_warned"] = True
+            changed.add(cid)
+            if channel:
+                view = discord.ui.View(timeout=None)
+                if ticket.get("server_link"):
+                    view.add_item(discord.ui.Button(label="Join Server", style=discord.ButtonStyle.link, url=ticket["server_link"]))
+                try:
+                    await channel.send(
+                        f"🚨 **Final warning:** <@{uid}> has been offline for **over {JOIN_FINAL_WARNING_SECONDS // 60} minutes** "
+                        f"after joining this {ticket['type'].lower()}. Roblox account **{h['username']}** is still **Offline**. "
+                        f"Join immediately or you may be removed from the helper list.",
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                except discord.HTTPException:
+                    pass
+                if guild:
+                    warn_ch = await get_warnings_channel(guild)
+                    if warn_ch and warn_ch.id != channel.id:
+                        try:
+                            await warn_ch.send(
+                                f"🚨 Final offline warning in {channel.mention}: <@{uid}> "
+                                f"({h['username']}) still Offline after {JOIN_FINAL_WARNING_SECONDS // 60}m.",
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        except discord.HTTPException:
+                            pass
 
     for cid in changed:
         save_ticket(int(cid), DATA["tickets"][cid])
@@ -5762,7 +5829,7 @@ async def before_join_watch_loop():
 
 
 async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
-    """When a raid ends: warn in #logs about helpers who were never seen online on Roblox."""
+    """When a raid ends: warn in #warnings (or #logs) about helpers who were never seen online on Roblox."""
     if not ROBLOX_COOKIE or bot.session is None or not ticket["helper_order"]:
         return
 
@@ -5789,8 +5856,8 @@ async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
 
     if not problems:
         return
-    logs_channel = await get_logs_channel(guild)
-    if not logs_channel:
+    target = await get_warnings_channel(guild) or await get_logs_channel(guild)
+    if not target:
         return
     embed = discord.Embed(
         title=f"Offline Helper Warning - {ticket_label(ticket)}",
@@ -5798,7 +5865,7 @@ async def warn_offline_helpers(guild: discord.Guild, ticket: dict):
         color=0xED4245,
     )
     embed.set_footer(text=BOT_NAME)
-    await logs_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await target.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ======================================================
@@ -6149,7 +6216,7 @@ async def frnd_request(interaction: discord.Interaction, member: discord.Member 
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-bot.tree.add_command(frnd_group)
+# bot.tree.add_command(frnd_group)  # removed per request: /frnd request
 
 
 # ======================================================
