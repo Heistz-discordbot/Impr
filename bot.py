@@ -83,7 +83,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DEVELOPER_ID = 1455426573741330495
 
 GUILD_ID = 1554169015662936114
-TICKET_CATEGORY_ID = 1561058769750982687
+TICKET_CATEGORY_ID = 1554174156671549553
 BATTLE_PANEL_CHANNEL_ID = 1554169017592451175
 RAID_RESULTS_CHANNEL_ID = 1554468736440729650
 LEADERBOARD_CHANNEL_ID = 1554469313782743050
@@ -198,8 +198,7 @@ def normalize_data(data: dict) -> dict:
     for key in ("panel_messages", "leaderboard_messages", "request_limits", "win_streaks", "configs",
                 "trackers", "blacklist", "links", "pending_links", "panel_channels", "leaderboard_channels",
                 "ticket_archive", "nuke_snapshots", "trusted", "type_counters",
-                "left_members", "archived_trackers", "recruit_queue", "ticket_categories",
-                "channel_map", "category_map"):
+                "left_members", "archived_trackers", "recruit_queue"):
         data.setdefault(key, {})
     for key in ("authorized_guilds", "audit", "global_history", "setup_guilds"):
         data.setdefault(key, [])
@@ -739,44 +738,14 @@ def saved_roblox_name(user_id: int):
 
 
 def find_category(guild: discord.Guild):
-    """The ticket category: stored per-guild id first, then global TICKET_CATEGORY_ID, then by name."""
-    gid = str(guild.id)
-    stored_id = DATA.get("ticket_categories", {}).get(gid)
-    if stored_id:
-        category = guild.get_channel(int(stored_id))
-        if isinstance(category, discord.CategoryChannel):
-            return category
+    """The ticket category: by id first, then by name (Cruxer, or the old Imperium name)."""
     category = guild.get_channel(TICKET_CATEGORY_ID)
     if isinstance(category, discord.CategoryChannel):
-        DATA.setdefault("ticket_categories", {})[gid] = category.id
         return category
-    found = discord.utils.find(
+    return discord.utils.find(
         lambda c: isinstance(c, discord.CategoryChannel) and c.name.lower() in CATEGORY_NAMES,
         guild.categories,
     )
-    if found:
-        DATA.setdefault("ticket_categories", {})[gid] = found.id
-    return found
-
-
-def store_guild_structure(guild: discord.Guild):
-    """Analyze and store channels + categories for this server (survives renames via IDs)."""
-    gid = str(guild.id)
-    DATA.setdefault("category_map", {})[gid] = {
-        str(c.id): {"name": c.name, "position": c.position}
-        for c in guild.categories
-    }
-    DATA.setdefault("channel_map", {})[gid] = {
-        str(c.id): {
-            "name": c.name,
-            "type": type(c).__name__,
-            "category_id": getattr(c, "category_id", None),
-            "position": c.position,
-        }
-        for c in guild.channels
-        if not isinstance(c, discord.CategoryChannel)
-    }
-    save_data()
 
 
 async def delete_previous(channel: discord.TextChannel, msg_key: str, chan_key: str):
@@ -1645,31 +1614,30 @@ def build_ticket_embed(ticket: dict) -> discord.Embed:
     else:
         title = f"{ticket['type']} Ticket  #{ticket['raid_number']}"
 
-    # Helpers (the pinged role) assist the requester — not the other way around.
     embed = discord.Embed(
         title=title,
         description=(
-            f"**Helpers will assist** <@{ticket['requester_id']}> "
-            f"({roblox_display(ticket['roblox_username'], ticket['roblox_id'])}).\n\n"
-            "Double-check all details before joining."
+            f"<@{ticket['requester_id']}> ({roblox_display(ticket['roblox_username'], ticket['roblox_id'])}) "
+            "will assist. Double-check all details before joining."
         ),
         color=EMBED_COLOR,
     )
 
-    embed.add_field(name="**SERVER REGION**", value=box(ticket["region"]), inline=True)
+    embed.add_field(name="SERVER REGION", value=box(ticket["region"]), inline=True)
     if ticket["type"] == "Raid":
-        embed.add_field(name="**ENEMY GUILD**", value=box(ticket["clan"]), inline=True)
+        embed.add_field(name="ENEMY GUILD", value=box(ticket["clan"]), inline=True)
 
-    embed.add_field(name="**REPORTED PLAYERS**", value=box(ticket["reported_players"] or "None"), inline=False)
+    embed.add_field(name="REPORTED PLAYERS", value=box(ticket["reported_players"]), inline=False)
+    embed.add_field(name="SERVER LINK", value=ticket["server_link"], inline=False)
 
     elapsed = format_duration(int(time.time()) - ticket["started_at"])
-    embed.add_field(name="**DURATION**", value=box(elapsed), inline=False)
+    embed.add_field(name="DURATION", value=box(elapsed), inline=False)
 
     if ticket["helper_order"]:
         helpers_text = "\n".join(helper_line(ticket, uid) for uid in ticket["helper_order"])
     else:
         helpers_text = "No helpers yet."
-    embed.add_field(name="**HELPERS**", value=helpers_text, inline=False)
+    embed.add_field(name="HELPERS", value=helpers_text, inline=False)
 
     footer = BOT_NAME + (" - edited by the requester" if ticket.get("edited_at") else "")
     embed.set_footer(text=footer)
@@ -1975,25 +1943,6 @@ class RaidExperienceModal(discord.ui.Modal, title="Raid Experience"):
         )
 
 
-class GankConfirmView(BlacklistGate, discord.ui.View):
-    def __init__(self, channel_id: int, url: str):
-        super().__init__(timeout=120)
-        self.channel_id = channel_id
-        self.url = url
-
-    @discord.ui.button(label="Yes, this is the gank", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ticket = get_ticket(self.channel_id)
-        if ticket:
-            ticket["gank_url"] = self.url
-            save_ticket(self.channel_id, ticket)
-        await interaction.response.edit_message(content="Gank image confirmed and saved.", view=None)
-
-    @discord.ui.button(label="No, cancel", style=discord.ButtonStyle.danger)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Gank image discarded. Press Upload Gank to try again.", view=None)
-
-
 class PostEndView(BlacklistGate, discord.ui.View):
     def __init__(self, channel_id: int):
         super().__init__(timeout=None)
@@ -2020,13 +1969,12 @@ class PostEndView(BlacklistGate, discord.ui.View):
         except asyncio.TimeoutError:
             return await interaction.followup.send("No image received. Press Upload Gank to try again.", ephemeral=True)
 
-        att = msg.attachments[0]
-        view = GankConfirmView(self.channel_id, att.url)
-        await interaction.followup.send(
-            f"Is this the correct gank image?\n{att.url}",
-            view=view,
-            ephemeral=True,
-        )
+        ticket = get_ticket(self.channel_id)
+        if ticket:
+            ticket["gank_url"] = msg.attachments[0].url
+            save_ticket(self.channel_id, ticket)
+
+        await interaction.followup.send("Gank image saved.", ephemeral=True)
 
     async def finish_callback(self, interaction: discord.Interaction):
         ticket = get_ticket(self.channel_id)
@@ -2178,13 +2126,13 @@ async def log_ticket_created(guild: discord.Guild, ticket: dict, ticket_jump_url
 
     created_str = time.strftime("%A, %d %B %Y %H:%M", time.gmtime(ticket["started_at"]))
     embed = discord.Embed(title=f"{ticket_label(ticket)} Created", color=EMBED_COLOR)
-    embed.add_field(name="**Opened By**", value=f"<@{ticket['requester_id']}>", inline=True)
-    embed.add_field(name="**Created**", value=created_str, inline=True)
-    embed.add_field(name="**Requester Roblox**", value=box(ticket["roblox_username"]), inline=False)
-    embed.add_field(name="**Region**", value=box(ticket["region"]), inline=True)
+    embed.add_field(name="Opened By", value=f"<@{ticket['requester_id']}>", inline=True)
+    embed.add_field(name="Created", value=created_str, inline=True)
+    embed.add_field(name="Requester Roblox", value=ticket["roblox_username"], inline=False)
+    embed.add_field(name="Region", value=ticket["region"], inline=True)
     if ticket["type"] == "Raid":
-        embed.add_field(name="**Enemy Guild**", value=box(ticket["clan"] or "None"), inline=True)
-    embed.add_field(name="**Reported Players**", value=box(ticket["reported_players"] or "None"), inline=False)
+        embed.add_field(name="Enemy Guild", value=ticket["clan"] or "None", inline=True)
+    embed.add_field(name="Reported Players", value=box(ticket["reported_players"]), inline=False)
     embed.set_footer(text=BOT_NAME)
 
     view = discord.ui.View(timeout=None)
@@ -2337,13 +2285,7 @@ CHANNEL_TYPES = [
 async def get_or_create_category(guild: discord.Guild) -> discord.CategoryChannel:
     category = find_category(guild)
     if category is None:
-        # Prefer the fixed ticket category ID if it exists in the server; otherwise create by name.
-        category = guild.get_channel(TICKET_CATEGORY_ID)
-        if not isinstance(category, discord.CategoryChannel):
-            category = await guild.create_category(AUTHORIZE_CATEGORY_NAME, reason=f"{BOT_NAME} /authorize setup")
-    DATA.setdefault("ticket_categories", {})[str(guild.id)] = category.id
-    store_guild_structure(guild)
-    save_data()
+        category = await guild.create_category(AUTHORIZE_CATEGORY_NAME, reason=f"{BOT_NAME} /authorize setup")
     return category
 
 
@@ -2683,7 +2625,6 @@ class CruxerBot(commands.Bot):
 
         self.add_view(PanelView())
         self.add_view(LeaderboardView())
-        self.add_view(PingRoleView())
         register_ticket_views()
 
         # Slash commands are synced per server in on_ready (see sync_guild_commands).
@@ -2874,13 +2815,6 @@ async def setup_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
-    # Ensure the ticket category exists / is stored (fixed ID preferred)
-    try:
-        cat = await get_or_create_category(guild)
-        cat_line = f"Ticket category: {cat.mention} (`{cat.id}`)"
-    except Exception as exc:
-        cat_line = f"Ticket category: could not ensure ({exc!r})"
-
     ping_lines: list = []
     await ensure_role(guild, RAID_PING_ROLE_ID, RAID_PING_ROLE_NAME, mentionable=True, lines=ping_lines)
     await ensure_role(guild, BACKUP_PING_ROLE_ID, BACKUP_PING_ROLE_NAME, mentionable=True, lines=ping_lines)
@@ -2904,7 +2838,6 @@ async def setup_command(interaction: discord.Interaction):
             promoted += 1
 
     embed = discord.Embed(title=f"{BOT_NAME} Setup Complete", color=EMBED_COLOR)
-    embed.add_field(name="Ticket Category", value=cat_line, inline=False)
     embed.add_field(name="Ping Roles", value="\n".join(ping_lines), inline=False)
     embed.add_field(name="Tier Roles", value="\n".join(tier_lines), inline=False)
 
@@ -2953,114 +2886,6 @@ async def backup_panel_command(interaction: discord.Interaction):
 
 bot.tree.add_command(raid_group)
 bot.tree.add_command(backup_group)
-
-
-# ======================================================
-# /pings  - self-assign |Raid Ping| / |Backup Ping|
-# ======================================================
-
-class PingRoleView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="|Raid Ping|", style=discord.ButtonStyle.primary, custom_id="cruxer:ping:raid")
-    async def raid_ping(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role = ping_role_for(interaction.guild, "Raid")
-        if role is None:
-            return await interaction.response.send_message(
-                "Raid Ping role is not set up. Run /setup first.", ephemeral=True
-            )
-        if role in interaction.user.roles:
-            await interaction.user.remove_roles(role, reason=f"{BOT_NAME} /pings toggle")
-            return await interaction.response.send_message(f"Removed {role.mention}.", ephemeral=True)
-        await interaction.user.add_roles(role, reason=f"{BOT_NAME} /pings")
-        await interaction.response.send_message(f"You now have {role.mention}.", ephemeral=True)
-
-    @discord.ui.button(label="|Backup Ping|", style=discord.ButtonStyle.secondary, custom_id="cruxer:ping:backup")
-    async def backup_ping(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role = ping_role_for(interaction.guild, "Backup")
-        if role is None:
-            return await interaction.response.send_message(
-                "Backup Ping role is not set up. Run /setup first.", ephemeral=True
-            )
-        if role in interaction.user.roles:
-            await interaction.user.remove_roles(role, reason=f"{BOT_NAME} /pings toggle")
-            return await interaction.response.send_message(f"Removed {role.mention}.", ephemeral=True)
-        await interaction.user.add_roles(role, reason=f"{BOT_NAME} /pings")
-        await interaction.response.send_message(f"You now have {role.mention}.", ephemeral=True)
-
-
-@bot.tree.command(name="pings", description="Post a self-assign embed for |Raid Ping| and |Backup Ping| roles")
-@app_commands.describe(channel="Channel to post the ping roles embed in")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def pings_command(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not await require_admin(interaction):
-        return
-    if not is_setup(interaction.guild.id):
-        return await interaction.response.send_message("Run /setup first so the ping roles exist.", ephemeral=True)
-
-    embed = discord.Embed(
-        title="Ping Roles",
-        description=(
-            "Choose the roles you want below.\n\n"
-            "**|Raid Ping|** — get notified when a new Raid ticket is opened.\n"
-            "**|Backup Ping|** — get notified when a new Backup ticket is opened.\n\n"
-            "Press again to remove the role."
-        ),
-        color=EMBED_COLOR,
-    )
-    embed.set_footer(text=BOT_NAME)
-    await channel.send(embed=embed, view=PingRoleView())
-    await interaction.response.send_message(f"Ping roles embed posted in {channel.mention}.", ephemeral=True)
-
-
-# ======================================================
-# /change  - rename category or channel in one step
-# ======================================================
-
-class ChangeNameModal(discord.ui.Modal, title="Change Name"):
-    def __init__(self, target: discord.abc.GuildChannel):
-        super().__init__()
-        self.target = target
-        self.new_name = discord.ui.TextInput(
-            label="New name",
-            default=target.name,
-            max_length=100,
-            required=True,
-        )
-        self.add_item(self.new_name)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        name = self.new_name.value.strip().replace(" ", "-").lower()
-        if not name:
-            return await interaction.response.send_message("Name cannot be empty.", ephemeral=True)
-        try:
-            old = self.target.name
-            await self.target.edit(name=name, reason=f"{BOT_NAME} /change by {interaction.user}")
-            # Keep ticket category mapping if this was the ticket category
-            if isinstance(self.target, discord.CategoryChannel):
-                DATA.setdefault("ticket_categories", {})[str(interaction.guild.id)] = self.target.id
-            store_guild_structure(interaction.guild)
-            await interaction.response.send_message(
-                f"Renamed **{old}** → **{name}**.", ephemeral=True
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message("I need Manage Channels to rename that.", ephemeral=True)
-        except discord.HTTPException as exc:
-            await interaction.response.send_message(f"Could not rename: {exc}", ephemeral=True)
-
-
-@bot.tree.command(name="change", description="Rename a category or channel")
-@app_commands.describe(
-    target="The category or channel to rename",
-)
-@app_commands.default_permissions(manage_channels=True)
-@app_commands.guild_only()
-async def change_command(interaction: discord.Interaction, target: discord.abc.GuildChannel):
-    if not interaction.user.guild_permissions.manage_channels and interaction.user.id != DEVELOPER_ID:
-        return await interaction.response.send_message("Manage Channels permission required.", ephemeral=True)
-    await interaction.response.send_modal(ChangeNameModal(target))
 
 
 # ======================================================
@@ -3634,71 +3459,6 @@ async def bot_stats_command(interaction: discord.Interaction):
     await interaction.response.defer()
     embed = build_bot_stats_embed(interaction.guild)
     await interaction.followup.send(embed=embed, view=BotStatsView(interaction.guild.id))
-
-
-
-
-# ======================================================
-# /bot avatar  - change bot profile picture by pasting an image
-
-# ======================================================
-
-@bot_group.command(name="avatar", description="[OWN] Change the bot avatar — paste an image/gif in this channel within 2 minutes")
-@app_commands.guild_only()
-async def bot_avatar_command(interaction: discord.Interaction):
-    if not can_use_own(interaction.user.id):
-        return await interaction.response.send_message(f"Only the {BOT_NAME} developer can change the bot avatar.", ephemeral=True)
-
-    await interaction.response.send_message(
-        "Paste (attach) the new avatar image or GIF in this channel within **2 minutes**. "
-        "No link needed — just send the file.",
-        ephemeral=True,
-    )
-
-    def check(m: discord.Message):
-        return (
-            m.channel.id == interaction.channel.id
-            and m.author.id == interaction.user.id
-            and m.attachments
-            and m.attachments[0].content_type
-            and m.attachments[0].content_type.startswith("image/")
-        )
-
-    try:
-        msg = await interaction.client.wait_for("message", check=check, timeout=120)
-    except asyncio.TimeoutError:
-        return await interaction.followup.send("No image received in time. Run the command again.", ephemeral=True)
-
-    att = msg.attachments[0]
-    if att.size > 8 * 1024 * 1024:
-        return await interaction.followup.send("Image is too large (max 8 MB for Discord avatars).", ephemeral=True)
-
-    try:
-        data = await att.read()
-        await bot.user.edit(avatar=data)
-        await interaction.followup.send("Bot avatar updated successfully.", ephemeral=True)
-    except discord.HTTPException as exc:
-        await interaction.followup.send(f"Could not update avatar: {exc}", ephemeral=True)
-    except Exception as exc:
-        await interaction.followup.send(f"Failed: {exc!r}", ephemeral=True)
-
-
-@bot_group.command(name="username", description="[OWN] Change the bot username")
-@app_commands.describe(name="New bot username (2-32 characters)")
-@app_commands.guild_only()
-async def bot_username_command(interaction: discord.Interaction, name: str):
-    if not can_use_own(interaction.user.id):
-        return await interaction.response.send_message(f"Only the {BOT_NAME} developer can change the bot username.", ephemeral=True)
-    name = name.strip()
-    if not (2 <= len(name) <= 32):
-        return await interaction.response.send_message("Username must be 2–32 characters.", ephemeral=True)
-    try:
-        await bot.user.edit(username=name)
-        await interaction.response.send_message(f"Bot username set to **{name}**.", ephemeral=True)
-    except discord.HTTPException as exc:
-        await interaction.response.send_message(f"Could not change username: {exc}", ephemeral=True)
-
-
 
 
 bot.tree.add_command(bot_group)
@@ -6838,10 +6598,6 @@ async def on_ready():
 
     for guild in bot.guilds:
         gid = str(guild.id)
-        try:
-            store_guild_structure(guild)
-        except Exception as exc:
-            print(f"[{BOT_NAME}] Could not store structure for {guild.name}: {exc!r}")
 
         # Authorized servers always get a #snipe channel (hitlist / see alerts only go there).
         if guild.id in DATA["authorized_guilds"]:
