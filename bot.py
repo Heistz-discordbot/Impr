@@ -90,7 +90,9 @@ PREFIXES = (".", "!", "?")     # default prefixes; slash commands remain availab
 OWN_PREFIX_COMMANDS = {"sync"}
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.getenv("CRUXER_DATA_DIR") or _BASE_DIR
+DATA_DIR = (os.getenv("CRUXER_DATA_DIR")
+            or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+            or _BASE_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 _NEW_DATA = os.path.join(DATA_DIR, "cruxer_data.json")
 _OLD_DATA = os.path.join(DATA_DIR, "imperium_data.json")
@@ -107,7 +109,8 @@ GLOBAL_FILE = os.getenv("CRUXER_GLOBAL_FILE") or os.path.join(_DATA_FOLDER, "cru
 SNAPSHOT_KEEP = 48
 SNAPSHOT_EVERY_SECONDS = 1800
 BACKUP_CHANNEL_ID = int(os.getenv("CRUXER_BACKUP_CHANNEL_ID") or 0)
-DATA_IS_PERSISTENT = bool(os.getenv("CRUXER_DATA_DIR") or os.getenv("CRUXER_DATA_FILE") or os.getenv("IMPERIUM_DATA_FILE"))
+DATA_IS_PERSISTENT = bool(os.getenv("CRUXER_DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+                          or os.getenv("CRUXER_DATA_FILE") or os.getenv("IMPERIUM_DATA_FILE"))
 
 LEADERBOARD_PAGE_SIZE = 10
 DAILY_REQUEST_LIMIT = 2
