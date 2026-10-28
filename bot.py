@@ -2,7 +2,7 @@
 Cruxer Discord Bot - discord.py 2.6+ (Components V2 layouts are used everywhere)
 
 Install:
-  pip install -U "discord.py>=2.6" aiohttp python-dotenv
+  pip install -U "discord.py>=2.6" aiohttp python-dotenv Pillow psutil
 
 Turn ON "Message Content Intent" and "Server Members Intent" in the Developer Portal (Bot tab).
 
@@ -34,6 +34,7 @@ import threading
 import time
 import uuid
 import warnings
+from PIL import Image, ImageOps
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -53,7 +54,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DEVELOPER_ID = 1455426573741330495
 
 GUILD_ID = 1554169015662936114
-TICKET_CATEGORY_ID = 1554174156671549553
+TICKET_CATEGORY_ID = 1564679069554188389
 BATTLE_PANEL_CHANNEL_ID = 1554169017592451175
 RAID_RESULTS_CHANNEL_ID = 1554468736440729650
 LEADERBOARD_CHANNEL_ID = 1554469313782743050
@@ -67,8 +68,8 @@ PING_ROLE_ID = 0
 EMBED_COLOR = 0x2B2D31
 GREEN, RED, YELLOW, BLUE = 0x57F287, 0xED4245, 0xFEE75C, 0x5865F2
 
-AUTHORIZE_CATEGORY_NAME = BOT_NAME
-CATEGORY_NAMES = {BOT_NAME.lower(), LEGACY_BOT_NAME.lower()}
+AUTHORIZE_CATEGORY_NAME = "Crusher Tickets"
+CATEGORY_NAMES = {BOT_NAME.lower(), LEGACY_BOT_NAME.lower(), "crusher tickets"}
 BATTLE_PANEL_CHANNEL_NAME = "battle-panel"
 RAID_RESULTS_CHANNEL_NAME = "raid-results"
 LEADERBOARD_CHANNEL_NAME = "leaderboard"
@@ -77,6 +78,7 @@ MVPS_CHANNEL_NAME = "mvps"
 SNIPE_CHANNEL_NAME = "snipe"
 README_CHANNEL_NAME = "read-me"
 WARNINGS_CHANNEL_NAME = "warnings"
+WARNINGS_CHANNEL_ID = 1564682942809247854
 
 SUPPORT_SERVER_INVITE = None
 PREFIXES = (".", "!")          # default prefixes ([OWN] prefix commands ALWAYS use these)
@@ -120,13 +122,13 @@ DEFAULT_PLACE_ID = 10418864827      # The Strongest Battlegrounds (used by the s
 SCAN_MAX_SERVERS = 800
 SCAN_TIME_BUDGET = 50               # seconds a /snipe server scan may run
 
-TICKET_MESS_THRESHOLD = 50
+TICKET_MESS_THRESHOLD = 25
 MESS_PREFIX = "**Ticket is getting busy.**"
 MESS_MESSAGES = [
-    "**Ticket is getting busy.**\nThis channel has a lot of messages. Use the button below to jump back to the request information.",
-    "**Heads up - high activity.**\nThere are many messages here. Jump to the ticket information so nothing important is missed.",
-    "**Busy ticket notice.**\nActivity is high in this channel. Return to the request details with the button below.",
+    "**Ticket activity reminder**\nThis ticket is active. Use the button below to return to the request details.",
 ]
+NO_ASSIST_WARNING_SECONDS = 300
+GANK_IMAGE_SIZE = (1200, 675)
 BACKUP_INTERVAL_HOURS = 1
 DURATION_UPDATE_SECONDS = 15
 
@@ -919,12 +921,10 @@ def build_readme_view(guild: discord.Guild, authorized: bool):
     if authorized:
         status = "Authorized"
         body = (
-            f"Thank you for authorizing {BOT_NAME} in **{guild.name}**.\n\n"
-            f"{BOT_NAME} is a raid coordination bot. These are the main things it does:\n"
-            "- Members **request a Raid or Backup** from the battle panel and get a private ticket.\n"
-            "- Helpers join with one click and every result is recorded in raid results and the leaderboard.\n"
-            "- Assisting in raids earns **Tier roles** with higher request limits.\n"
-            "- Use `/pings` to pick your Raid / Backup ping roles."
+            f"Thanks for using **{BOT_NAME}** in **{guild.name}**.\n\n"
+            "**New in Cruxer:** choose **Help** from the battle panel for a quick guide; tickets now include a Guide button, "
+            "clearer request details, and refreshed activity reminders. Helpers can assist without linking Roblox.\n\n"
+            "Open the battle panel to create a Raid or Backup ticket."
         )
     else:
         status = "Unauthorized"
@@ -1100,16 +1100,21 @@ async def detect_server_region(session: aiohttp.ClientSession, place_id, job_id)
     if not place_id or not job_id:
         return None
     job_id = str(job_id).lower()
-    if job_id in REGION_CACHE:
-        return REGION_CACHE[job_id]
-    region = await _try_ralvora(session, place_id, job_id)
-    if not region:
-        region = await _try_gamejoin_region(session, place_id, job_id)
-    if region:
-        REGION_CACHE[job_id] = region
-        if len(REGION_CACHE) > 500:
-            REGION_CACHE.pop(next(iter(REGION_CACHE)))
-    return region
+    cache_key = f"{place_id}:{job_id}"
+    if cache_key in REGION_CACHE:
+        return REGION_CACHE[cache_key]
+    for lookup in (_try_ralvora, _try_gamejoin_region):
+        try:
+            region = await lookup(session, place_id, job_id)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+            print(f"[{BOT_NAME}] Region lookup via {lookup.__name__} failed: {exc!r}")
+            region = None
+        if region:
+            REGION_CACHE[cache_key] = region
+            if len(REGION_CACHE) > 500:
+                REGION_CACHE.pop(next(iter(REGION_CACHE)))
+            return region
+    return None
 
 
 async def _try_ralvora(session: aiohttp.ClientSession, place_id, job_id):
@@ -1426,6 +1431,8 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
 
         config_btn = discord.ui.Button(label="Configuration", style=discord.ButtonStyle.secondary, custom_id="tsb:panel:config")
         config_btn.callback = self.config_callback
+        help_btn = discord.ui.Button(label="Help", style=discord.ButtonStyle.primary, custom_id="tsb:panel:help")
+        help_btn.callback = self.help_callback
 
         request_select = discord.ui.Select(
             placeholder="Choose Raid, Backup or Help",
@@ -1480,7 +1487,7 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
                 "- Save your details before making a ticket so they are autofilled. "
                 "Tap the Configuration button again to edit them."
             ),
-            discord.ui.ActionRow(config_btn),
+            discord.ui.ActionRow(config_btn, help_btn),
             discord.ui.Separator(),
             discord.ui.TextDisplay(
                 "## Create rescue ticket now:\n"
@@ -1491,6 +1498,9 @@ class PanelView(BlacklistGate, discord.ui.LayoutView):
 
     async def config_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(ConfigModal(interaction.user.id))
+
+    async def help_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(view=help_view(), ephemeral=True)
 
 
 async def refresh_panel(channel: discord.TextChannel):
@@ -1695,6 +1705,7 @@ class RequestModal(discord.ui.Modal):
             "status": "open", "result": None, "experience": None, "gank_url": None, "gank_file": None,
             "ended_at": None, "ended_by": None, "deleted_by": None, "results_url": None,
             "info_message_id": None, "message_count": 0, "edit_btn": True, "v2": True, "ping": ping,
+            "no_assist_warned": False, "busy_message_id": None,
         }
 
         viewer = guild.get_role(VIEWER_ROLE_ID) or guild.default_role
@@ -1787,7 +1798,8 @@ class TicketView(BlacklistGate, discord.ui.LayoutView):
         name, display = t["roblox_username"], t.get("roblox_display")
         shown = f"{display} (@{name})" if display and display.lower() != name.lower() else f"@{name}"
         who = (f"## [{shown}]({url})" if url else f"## {shown}") + \
-              f"\n<@{t['requester_id']}> will assist. Double-check all details before joining."
+              f"\n{t.get('ping') or 'The required helpers'} will assist. Double-check all details before joining. " \
+              'Rename fields freely, e.g., “Anyone Attacking Me” for “Enemy player names”. Make sure every field is filled out correctly so we can handle your request faster.'
         if t.get("avatar_url"):
             children.append(discord.ui.Section(discord.ui.TextDisplay(who), accessory=discord.ui.Thumbnail(t["avatar_url"])))
         else:
@@ -1802,10 +1814,8 @@ class TicketView(BlacklistGate, discord.ui.LayoutView):
         children.append(discord.ui.TextDisplay(f"## Reported Players\n{box(t.get('reported_players'))}"))
         children.append(discord.ui.Separator())
 
-        link_text = f"[Join Session]({t['server_link']})" if t.get("server_link") else "None"
         session_text = (
-            "## Session Info\n"
-            f"- **Server Link:** {link_text}\n"
+            "## Request Info\n"
             f"- **Opened:** <t:{t['started_at']}:R>\n"
             f"- **Duration:** `{format_duration(end - t['started_at'])}`"
         )
@@ -1829,10 +1839,12 @@ class TicketView(BlacklistGate, discord.ui.LayoutView):
             buttons.append(join_btn)
         buttons.append(link_btn("Profile", url))
         if is_open:
-            buttons.append(link_btn("Join Session", t.get("server_link")))
             end_btn = discord.ui.Button(label="End", style=discord.ButtonStyle.danger, custom_id=f"tsb:end:{channel_id}")
             end_btn.callback = self.end_callback
             buttons.append(end_btn)
+        guide_btn = discord.ui.Button(label="Guide", style=discord.ButtonStyle.secondary, custom_id=f"tsb:guide:{channel_id}")
+        guide_btn.callback = self.guide_callback
+        buttons.append(guide_btn)
         row = [b for b in buttons if b is not None]
         if row:
             children.append(discord.ui.ActionRow(*row))
@@ -1847,6 +1859,15 @@ class TicketView(BlacklistGate, discord.ui.LayoutView):
         if str(interaction.user.id) in ticket["helpers"]:
             return await interaction.response.send_message("You already joined this raid.", ephemeral=True)
         await interaction.response.send_modal(JoinRobloxModal(self.channel_id, interaction.user.id))
+
+    async def guide_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(view=card(
+            "## Quick Guide",
+            "1. Check the server region and reported player names.\n"
+            "2. Press **Join Raid** to register as an assistant, then join the requester in Roblox.\n"
+            "3. Use the ticket chat to coordinate and tell the requester when you are ready.\n"
+            "4. The requester or staff can end the ticket and record the result. Helpers do not need to link Roblox.",
+            footer=BOT_NAME), ephemeral=True)
 
     async def end_callback(self, interaction: discord.Interaction):
         ticket = get_ticket(self.channel_id)
@@ -2067,15 +2088,18 @@ class PostEndView(BlacklistGate, discord.ui.View):
             # image used to show up blank in raid results.
             try:
                 raw = await att.read()
-                ext = os.path.splitext(att.filename)[1].lower()
-                if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-                    ext = ".png"
+                with Image.open(io.BytesIO(raw)) as source:
+                    normalized = ImageOps.fit(source.convert("RGB"), GANK_IMAGE_SIZE, method=Image.Resampling.LANCZOS,
+                                              centering=(0.5, 0.5))
+                    output = io.BytesIO()
+                    normalized.save(output, format="JPEG", quality=90, optimize=True)
+                    raw = output.getvalue()
                 os.makedirs(GANK_DIR, exist_ok=True)
-                path = os.path.join(GANK_DIR, f"{ticket['guild_id']}_{ticket['raid_number']}{ext}")
+                path = os.path.join(GANK_DIR, f"{ticket['guild_id']}_{ticket['raid_number']}.jpg")
                 with open(path, "wb") as f:
                     f.write(raw)
                 ticket["gank_file"] = path
-            except (discord.HTTPException, OSError) as exc:
+            except (discord.HTTPException, OSError, ValueError) as exc:
                 print(f"[{BOT_NAME}] Could not keep the gank image: {exc!r}")
             ticket["gank_url"] = att.url
             save_ticket(self.channel_id, ticket)
@@ -2438,7 +2462,7 @@ async def get_or_create_category(guild: discord.Guild) -> discord.CategoryChanne
     category = find_category(guild)
     if category is None:
         category = await guild.create_category(AUTHORIZE_CATEGORY_NAME, reason=f"{BOT_NAME} /authorize setup")
-    elif category.name.lower() == LEGACY_BOT_NAME.lower():
+    elif category.name != AUTHORIZE_CATEGORY_NAME:
         try:
             await category.edit(name=AUTHORIZE_CATEGORY_NAME, reason=f"{BOT_NAME} rename")
         except discord.HTTPException:
@@ -2744,6 +2768,7 @@ class CruxerBot(commands.Bot):
         duration_updater.start()
         tracker_loop.start()
         join_watch_loop.start()
+        no_assist_watch_loop.start()
         backup_loop.start()
 
     async def close(self):
@@ -2810,25 +2835,31 @@ async def before_duration_updater():
 
 @bot.listen("on_message")
 async def ticket_busy_watcher(message: discord.Message):
-    if message.guild is None:
-        return
-    if message.author.id == bot.user.id and (message.content or "").startswith(MESS_PREFIX):
+    if message.guild is None or message.author.bot:
         return
     ticket = get_ticket(message.channel.id)
     if not ticket or ticket["status"] == "deleted":
         return
     ticket["message_count"] = ticket.get("message_count", 0) + 1
     n = ticket["message_count"]
-    if n > TICKET_MESS_THRESHOLD and (n - 1) % TICKET_MESS_THRESHOLD == 0:
+    if n % TICKET_MESS_THRESHOLD == 0:
+        previous_id = ticket.get("busy_message_id")
+        if previous_id:
+            try:
+                old_notice = await message.channel.fetch_message(previous_id)
+                await old_notice.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
         info_id = await locate_info_message_id(message.channel, ticket)
         view = None
         if info_id:
             url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{info_id}"
             view = discord.ui.View(timeout=None)
             view.add_item(discord.ui.Button(label="Jump to Information", style=discord.ButtonStyle.link, url=url))
-        msg_text = MESS_MESSAGES[(n // TICKET_MESS_THRESHOLD - 1) % len(MESS_MESSAGES)] + f"\n-# {n} messages in this ticket."
+        msg_text = MESS_MESSAGES[0] + f"\n-# {n} messages in this ticket."
         try:
-            await message.channel.send(msg_text, view=view)
+            notice = await message.channel.send(msg_text, view=view)
+            ticket["busy_message_id"] = notice.id
         except discord.HTTPException:
             pass
         save_ticket(message.channel.id, ticket)
@@ -2911,8 +2942,24 @@ async def say_command(interaction: discord.Interaction, message: str):
 @bot.tree.command(name="ping", description="Check Cruxer's latency and connection")
 @app_commands.guild_only()
 async def ping_command(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        view=card(f"## {BOT_NAME} is online", f"**Latency:** `{round(bot.latency * 1000)} ms`", footer=BOT_NAME, color=GREEN))
+    uptime = format_duration(int(time.time()) - BOT_START_TIME)
+    try:
+        import psutil
+        proc = psutil.Process(os.getpid())
+        ram_mb = proc.memory_info().rss / (1024 * 1024)
+        cpu_text = f"{proc.cpu_percent(interval=None):.1f}%"
+    except Exception:
+        ram_mb, cpu_text = 0, "Unavailable"
+    members = sum(g.member_count or 0 for g in bot.guilds)
+    size_mb = os.path.getsize(DATA_FILE) / (1024 * 1024) if os.path.exists(DATA_FILE) else 0
+    await interaction.response.send_message(view=card(
+        f"## 🟢 {BOT_NAME}",
+        f"📊 **Latency:** {round(bot.latency * 1000)} ms\n"
+        f"⏱️ **Uptime:** {uptime}\n"
+        f"🖥️ **Resources**\n　▣ RAM: {ram_mb:.0f} MB\n　⚙️ CPU: {cpu_text}\n"
+        f"📈 **Size:** {size_mb:.2f} MB data\n"
+        f"🌐 **Servers:** {len(bot.guilds)}\n👥 **Members:** {members:,}",
+        footer=BOT_NAME, color=GREEN))
 
 
 @bot.tree.command(name="nuke", description="Go on. Press it.")
@@ -5029,8 +5076,47 @@ class JoinCheckView(BlacklistGate, discord.ui.LayoutView):
 # HELPER WATCHER (offline 3 min = first warning, 10 min = final warning)
 # ======================================================
 
+@tasks.loop(seconds=30)
+async def no_assist_watch_loop():
+    now = int(time.time())
+    for cid, ticket in list(DATA["tickets"].items()):
+        if (ticket.get("status") != "open" or ticket.get("no_assist_warned")
+                or ticket.get("helper_order") or now - ticket.get("started_at", now) < NO_ASSIST_WARNING_SECONDS):
+            continue
+        channel = bot.get_channel(int(cid))
+        guild = bot.get_guild(ticket.get("guild_id"))
+        if channel is None or guild is None:
+            continue
+        role = ping_role_for(guild, ticket.get("type", "Backup"))
+        mention = role.mention if role else ticket.get("ping")
+        prefix = f"{mention} " if mention else ""
+        try:
+            await channel.send(
+                f"{prefix}This {ticket.get('type', 'request').lower()} ticket has been open for **5 minutes** "
+                "and no helpers have joined yet. If you can assist, please check the request and use **Join Raid**.",
+                allowed_mentions=discord.AllowedMentions(roles=True))
+        except discord.HTTPException as exc:
+            print(f"[{BOT_NAME}] Could not send no-assist reminder for {cid}: {exc!r}")
+            continue
+        ticket["no_assist_warned"] = True
+        save_ticket(int(cid), ticket)
+        try:
+            warning_channel = await get_warnings_channel(guild)
+            if warning_channel and warning_channel.id != channel.id:
+                await warning_channel.send(
+                    f"{prefix}No assistance yet: {ticket_label(ticket)} in {channel.mention} has been open for five minutes.",
+                    allowed_mentions=discord.AllowedMentions(roles=True))
+        except discord.HTTPException as exc:
+            print(f"[{BOT_NAME}] Could not mirror no-assist warning for {cid}: {exc!r}")
+
+
+@no_assist_watch_loop.before_loop
+async def before_no_assist_watch_loop():
+    await bot.wait_until_ready()
+
+
 async def get_warnings_channel(guild: discord.Guild):
-    ch = discord.utils.get(guild.text_channels, name=WARNINGS_CHANNEL_NAME)
+    ch = guild.get_channel(WARNINGS_CHANNEL_ID) or discord.utils.get(guild.text_channels, name=WARNINGS_CHANNEL_NAME)
     return ch if isinstance(ch, discord.TextChannel) else await get_logs_channel(guild)
 
 
