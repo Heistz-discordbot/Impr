@@ -34,8 +34,12 @@ import threading
 import time
 import uuid
 import warnings
-from PIL import Image, ImageOps
 from datetime import datetime, timedelta, timezone
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = ImageOps = None
 
 import aiohttp
 import discord
@@ -2088,14 +2092,19 @@ class PostEndView(BlacklistGate, discord.ui.View):
             # image used to show up blank in raid results.
             try:
                 raw = await att.read()
-                with Image.open(io.BytesIO(raw)) as source:
-                    normalized = ImageOps.fit(source.convert("RGB"), GANK_IMAGE_SIZE, method=Image.Resampling.LANCZOS,
-                                              centering=(0.5, 0.5))
-                    output = io.BytesIO()
-                    normalized.save(output, format="JPEG", quality=90, optimize=True)
-                    raw = output.getvalue()
+                normalized_image = Image is not None
+                ext = ".jpg" if normalized_image else os.path.splitext(att.filename)[1].lower()
+                if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                    ext = ".png"
+                if normalized_image:
+                    with Image.open(io.BytesIO(raw)) as source:
+                        normalized = ImageOps.fit(source.convert("RGB"), GANK_IMAGE_SIZE,
+                                                  method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+                        output = io.BytesIO()
+                        normalized.save(output, format="JPEG", quality=90, optimize=True)
+                        raw = output.getvalue()
                 os.makedirs(GANK_DIR, exist_ok=True)
-                path = os.path.join(GANK_DIR, f"{ticket['guild_id']}_{ticket['raid_number']}.jpg")
+                path = os.path.join(GANK_DIR, f"{ticket['guild_id']}_{ticket['raid_number']}{ext}")
                 with open(path, "wb") as f:
                     f.write(raw)
                 ticket["gank_file"] = path
